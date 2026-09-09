@@ -264,6 +264,11 @@ impl Runner {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
+        // 设置工作目录为用户主目录(避免在 System32 下创建文件)
+        if let Some(home) = dirs::home_dir() {
+            cmd.current_dir(home);
+        }
+
         let mut child = cmd.spawn().map_err(|e| {
             anyhow::anyhow!(
                 "无法启动后端进程:{}\n命令:{}",
