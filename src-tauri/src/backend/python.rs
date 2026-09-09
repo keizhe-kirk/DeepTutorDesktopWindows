@@ -68,9 +68,14 @@ fn candidates() -> Vec<(PathBuf, Vec<String>)> {
         }
     }
 
-    // 2. PATH
+    // 2. PATH (跳过 WindowsApps stub)
     for name in ["python", "python3"] {
         if let Ok(p) = which::which(name) {
+            let p_str = p.to_string_lossy();
+            // 跳过 WindowsApps 下的 stub
+            if p_str.contains("WindowsApps") {
+                continue;
+            }
             out.push((p, Vec::new()));
         }
     }
