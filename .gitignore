@@ -17,6 +17,9 @@ build/
 *.exe
 *.msi
 
+# DeepTutor 运行时配置(deeptutor.api.run_server 自动创建)
+data/
+
 # 缓存
 .vscode/
 .idea/
