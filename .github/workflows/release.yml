@@ -1,0 +1,99 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+  TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+jobs:
+  build-windows:
+    name: Build Windows installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install pnpm
+        run: npm install -g pnpm@10
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      # 设置了 TAURI_SIGNING_PRIVATE_KEY 时,tauri build 会自动对产物签名并生成 .sig
+      - name: Build Tauri bundle (MSI + NSIS, signed)
+        run: pnpm tauri build --target x86_64-pc-windows-msvc
+
+      - name: Generate updater manifest (latest.json)
+        id: manifest
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $conf = Get-Content "src-tauri\tauri.conf.json" -Raw | ConvertFrom-Json
+          $version = $conf.version
+          $bundleRoot = "src-tauri\target\x86_64-pc-windows-msvc\release\bundle"
+          $nsis = Get-ChildItem -Path $bundleRoot -Recurse -Filter "*.exe" |
+            Where-Object { $_.FullName -match 'nsis' } | Select-Object -First 1
+          $sig = Get-ChildItem -Path $bundleRoot -Recurse -Filter "*.sig" | Select-Object -First 1
+          if (-not $nsis) { throw "NSIS bundle not found" }
+          if (-not $sig) { throw "Signature (.sig) not found - ensure TAURI_SIGNING_PRIVATE_KEY is set" }
+
+          $signature = (Get-Content $sig.FullName -Raw).Trim()
+          $tag = $env:GITHUB_REF -replace 'refs/tags/',''
+          $repo = $env:GITHUB_REPOSITORY
+          $url = "https://github.com/$repo/releases/download/$tag/$($nsis.Name)"
+          $pubDate = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+          $manifest = [ordered]@{
+            version   = $version
+            notes     = "See https://github.com/$repo/releases/tag/$tag"
+            pub_date  = $pubDate
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                signature = $signature
+                url       = $url
+              }
+            }
+          } | ConvertTo-Json -Depth 5
+
+          $manifest | Out-File -FilePath "latest.json" -Encoding utf8
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "nsis=$($nsis.FullName)" >> $env:GITHUB_OUTPUT
+          Write-Host "latest.json generated for v$version"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-installer
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            latest.json
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            latest.json
+          draft: false
+          prerelease: false
+          generate_release_notes: true

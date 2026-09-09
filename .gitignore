@@ -1,0 +1,26 @@
+# 依赖与开发依赖
+node_modules/
+src-tauri/target/
+src-tauri/gen/
+*.log
+.DS_Store
+Thumbs.db
+
+# Python 环境隔离
+.venv/
+__pycache__/
+*.pyc
+
+# 构建产物
+dist/
+build/
+*.exe
+*.msi
+
+# 缓存
+.vscode/
+.idea/
+
+# 临时
+tmp/
+.cache/
