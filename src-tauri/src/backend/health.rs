@@ -41,8 +41,8 @@ impl Health {
     }
 }
 
-/// API 侧按顺序尝试的路径。
-const API_PATHS: [&str; 3] = ["/api/health", "/health", "/"];
+/// API 侧按顺序尝试的路径(FastAPI 默认有 /docs,也可用 /api/health 或根路径)。
+const API_PATHS: [&str; 4] = ["/docs", "/api/health", "/health", "/"];
 
 /// 健康轮询器。
 pub struct Prober {

@@ -48,9 +48,9 @@ Shell start
         └─< 缺失 -> 引导安装/选择解释器
   └─> pip show deeptutor
         └─< 缺失 -> `pip install -U deeptutor`
-  └─> spawn: deeptutor start --child
+  └─> spawn: python -m deeptutor.api.run_server (默认只起后端:8001)
               (捕获 stdout/stderr → shell Tauri event "log")
-              (健康轮询 :8001/3782 → state machine: Booting/Ready/Crashed)
+              (健康轮询 :8001(/docs) 与 :3782(/) → state machine: Booting/Ready/Crashed)
   └─> WebView2 navigate http://127.0.0.1:3782
         └─< 200 -> 显示主界面
         └─< 持续 5xx -> 显示"启动失败"对话框,引导查看日志

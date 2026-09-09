@@ -56,9 +56,12 @@ fn env_u64(key: &str, default: u64) -> u64 {
 pub struct BackendConfig {
     /// 显式指定 Python 解释器(覆盖自动探测)。
     pub python: Option<PathBuf>,
-    /// Python 模块名,默认 `deeptutor`(即 `python -m deeptutor`)。
+    /// Python 模块名,默认 `deeptutor.api.run_server`(DeepTutor 真实入口: `python -m deeptutor.api.run_server`)。
+    ///
+    /// 等效的 CLI 命令是 `deeptutor serve`(只起后端)或 `deeptutor start`(同时起前后端)。
+    /// 如果需要同时起前端,可设 DEEPTUTOR_MODULE=deeptutor, DEEPTUTOR_ARGS="start"。
     pub module: String,
-    /// 传给模块的参数,默认 `start --child`。
+    /// 传给模块的参数,默认为空(run_server 不需要额外参数)。
     pub args: Vec<String>,
     /// 直接运行某个脚本而不是 `-m module`(mock / 排障用)。
     pub script: Option<PathBuf>,
@@ -80,10 +83,11 @@ impl BackendConfig {
     pub fn from_env() -> Self {
         Self {
             python: env_path("DEEPTUTOR_PYTHON"),
-            module: env_str("DEEPTUTOR_MODULE", "deeptutor"),
-            args: env_str("DEEPTUTOR_ARGS", "start --child")
+            module: env_str("DEEPTUTOR_MODULE", "deeptutor.api.run_server"),
+            args: env_str("DEEPTUTOR_ARGS", "")
                 .split_whitespace()
                 .map(|s| s.to_string())
+                .filter(|s| !s.is_empty())
                 .collect(),
             script: env_path("DEEPTUTOR_BACKEND_SCRIPT"),
             api_port: env_u16("DEEPTUTOR_API_PORT", 8001),

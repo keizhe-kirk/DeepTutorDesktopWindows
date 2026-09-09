@@ -67,4 +67,5 @@ Write-Host "`n[4/4] 验证安装..." -ForegroundColor Yellow
 & $VenvPython -c "import deeptutor; print('  deeptutor module: OK')"
 
 Write-Host "`n== 完成 ==" -ForegroundColor Green
-Write-Host "后续启动: $VenvPython -m deeptutor start" -ForegroundColor Green
+Write-Host "安装完成。桌面壳会自动拉起后端 (python -m deeptutor.api.run_server :8001)。" -ForegroundColor Green
+Write-Host "如需手动启动后端: $VenvPython -m deeptutor.api.run_server" -ForegroundColor Cyan

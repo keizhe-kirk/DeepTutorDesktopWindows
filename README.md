@@ -86,23 +86,25 @@ LocatingPython   探测 Python(DEEPTUTOR_PYTHON → PATH → py -3.xx → 常见
       │
 CheckingDeps     用 importlib.util.find_spec('deeptutor') 检查后端包
       │
-Starting         python -m deeptutor start --child(Windows 下 CREATE_NO_WINDOW,UTF-8/无缓冲)
+Starting         python -m deeptutor.api.run_server(Windows 下 CREATE_NO_WINDOW,UTF-8/无缓冲)
       │          stdout/stderr 逐行 emit `backend://log`,UI 实时滚动
-Probing          每 500ms 探 :8001(/api/health → /health → /)与 :3782(/)
+Probing          每 500ms 探 :8001(/docs → /api/health → /health → /)与 :3782(/)
       │
 Ready            WebView 导航到 http://127.0.0.1:<web_port>
    └─ 任一环节失败 → Failed,UI 给出可执行修复建议 + 一键重试
 ```
 
-退出时壳层用 `taskkill /PID <pid> /T` 清理整个进程树,避免 uvicorn / Next.js 孙进程残留占端口。
+> **注意**:DeepTutor 主项目默认 `deeptutor start` 同时起后端(:8001)+ 前端(:3782),
+> 但桌面壳**只起后端**(壳层自带 WebView2 负责前端显示),因此使用 `deeptutor.api.run_server` 模块。
+> 如需同时起前端(调试/开发),可设 `DEEPTUTOR_MODULE=deeptutor` + `DEEPTUTOR_ARGS=start`。
 
 ### 启动配置(全部可用环境变量覆盖)
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
 | `DEEPTUTOR_PYTHON` | 自动探测 | 直接指定解释器路径 |
-| `DEEPTUTOR_MODULE` | `deeptutor` | `python -m <module>` |
-| `DEEPTUTOR_ARGS` | `start --child` | 传给模块的参数 |
+| `DEEPTUTOR_MODULE` | `deeptutor.api.run_server` | `python -m <module>`(DeepTutor 真实后端入口) |
+| `DEEPTUTOR_ARGS` | 空 | 传给模块的参数(run_server 不需要) |
 | `DEEPTUTOR_BACKEND_SCRIPT` | 空 | 直接跑某个 .py(调试 / mock 用) |
 | `DEEPTUTOR_API_PORT` | `8001` | FastAPI 端口 |
 | `DEEPTUTOR_WEB_PORT` | `3782` | Next.js 端口 |
@@ -120,6 +122,9 @@ pnpm tauri dev
 `scripts/mock-backend.py` 会在 :8001 / :3782 起两个假服务(并模拟 2 秒冷启动),
 并把访问日志写到 `%TEMP%\deeptutor-mock-access.log` —— 出现 `GET :3782 /`
 就说明"探测 → 拉起 → 探活 → 导航"整条链路真的跑通了。
+
+> **注意**:真实 `deeptutor.api.run_server` 只起后端(:8001),前端(:3782)需由壳层 WebView 加载(或用 `deeptutor start` 同时起)。
+> mock 模拟了两个端口以验证壳层完整的双端口探活逻辑。
 
 ---
 
