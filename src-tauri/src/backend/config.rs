@@ -84,7 +84,7 @@ impl BackendConfig {
         Self {
             python: env_path("DEEPTUTOR_PYTHON"),
             module: env_str("DEEPTUTOR_MODULE", "deeptutor"),
-            args: env_str("DEEPTUTOR_ARGS", "start")
+            args: env_str("DEEPTUTOR_ARGS", "start --no-browser")
                 .split_whitespace()
                 .map(|s| s.to_string())
                 .filter(|s| !s.is_empty())
