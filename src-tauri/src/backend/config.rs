@@ -83,8 +83,8 @@ impl BackendConfig {
     pub fn from_env() -> Self {
         Self {
             python: env_path("DEEPTUTOR_PYTHON"),
-            module: env_str("DEEPTUTOR_MODULE", "deeptutor.api.run_server"),
-            args: env_str("DEEPTUTOR_ARGS", "")
+            module: env_str("DEEPTUTOR_MODULE", "deeptutor"),
+            args: env_str("DEEPTUTOR_ARGS", "start")
                 .split_whitespace()
                 .map(|s| s.to_string())
                 .filter(|s| !s.is_empty())
