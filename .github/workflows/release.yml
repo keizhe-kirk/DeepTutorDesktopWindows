@@ -31,10 +31,10 @@ jobs:
           node-version: '22'
 
       - name: Install pnpm
-        run: npm install -g pnpm@10
+        run: npm install -g pnpm@11
 
       - name: Install frontend deps
-        run: pnpm install --frozen-lockfile
+        run: pnpm install
 
       # 设置了 TAURI_SIGNING_PRIVATE_KEY 时,tauri build 会自动对产物签名并生成 .sig
       - name: Build Tauri bundle (MSI + NSIS, signed)
