@@ -50,15 +50,21 @@ jobs:
           $bundleRoot = "src-tauri\target\x86_64-pc-windows-msvc\release\bundle"
           $nsis = Get-ChildItem -Path $bundleRoot -Recurse -Filter "*.exe" |
             Where-Object { $_.FullName -match 'nsis' } | Select-Object -First 1
-          $sig = Get-ChildItem -Path $bundleRoot -Recurse -Filter "*.sig" | Select-Object -First 1
+          $sig = Get-ChildItem -Path $bundleRoot -Recurse -Filter "*.sig" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $nsis) { throw "NSIS bundle not found" }
-          if (-not $sig) { throw "Signature (.sig) not found - ensure TAURI_SIGNING_PRIVATE_KEY is set" }
 
-          $signature = (Get-Content $sig.FullName -Raw).Trim()
           $tag = $env:GITHUB_REF -replace 'refs/tags/',''
           $repo = $env:GITHUB_REPOSITORY
           $url = "https://github.com/$repo/releases/download/$tag/$($nsis.Name)"
           $pubDate = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+
+          if ($sig) {
+            $signature = (Get-Content $sig.FullName -Raw).Trim()
+            Write-Host "Signature found, updater manifest will include signature"
+          } else {
+            $signature = ""
+            Write-Host "WARNING: No signature file found. Updater manifest will have empty signature."
+          }
 
           $manifest = [ordered]@{
             version   = $version
