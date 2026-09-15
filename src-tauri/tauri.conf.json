@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "DeepTutor",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "identifier": "ai.hkuds.deeptutor.desktop",
   "build": {
     "beforeDevCommand": "pnpm dev",
@@ -62,7 +62,7 @@
       "endpoints": [
         "https://github.com/keizhe-kirk/DeepTutorDesktopWindows/releases/latest/download/latest.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJCNUU1NEQxQTJENEUyNUUKUldSZTR0U2kwVlJlS3l5OG1ud0dVV2Z6T0ljMWc1dFlpNFBNSmNaUGlSdFJ0R0FjSXZNNmlQWTkK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDgzQjMwRDA5MjJENDdEODIKUldTQ2ZkUWlDUTJ6ZzVOMm4wN0VlUy91QjdPcnI1ZjR4dnU1WlhLYzBJNk0wdzRFU1IvalVTaSsK",
       "windows": {
         "installMode": "passive"
       }

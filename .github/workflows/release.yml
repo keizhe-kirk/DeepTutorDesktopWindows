@@ -20,6 +20,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 快速失败:没有签名密钥就别跑 25 分钟构建了。
+      # 缺密钥会导致安装包不带 .sig、latest.json 的 signature 为空,
+      # 届时 tauri-plugin-updater 校验必然失败 —— 自动更新形同虚设。
+      - name: Check updater signing key is configured
+        shell: pwsh
+        run: |
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY) {
+            throw "缺少仓库 Secret: TAURI_SIGNING_PRIVATE_KEY —— 自动更新会因签名校验失败而不可用。请在 Settings → Secrets and variables → Actions 中配置 TAURI_SIGNING_PRIVATE_KEY 与 TAURI_SIGNING_PRIVATE_KEY_PASSWORD 后再发版。"
+          }
+          if (-not $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
+            throw "缺少仓库 Secret: TAURI_SIGNING_PRIVATE_KEY_PASSWORD —— 本项目的私钥带密码,缺失会导致签名步骤挂起等待输入直至超时。"
+          }
+          Write-Host "签名密钥已配置 (private key length = $($env:TAURI_SIGNING_PRIVATE_KEY.Length))"
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -76,13 +90,12 @@ jobs:
           $url = "https://github.com/$repo/releases/download/$tag/$($nsis.Name)"
           $pubDate = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
-          if ($sig) {
-            $signature = (Get-Content $sig.FullName -Raw).Trim()
-            Write-Host "Signature found, updater manifest will include signature"
-          } else {
-            $signature = ""
-            Write-Host "WARNING: No signature file found. Updater manifest will have empty signature."
+          # 硬失败:宁可不发版,也不发一个 signature 为空、自动更新装不上的版本。
+          if (-not $sig) {
+            throw "未找到签名文件 (*.exe.sig)。请确认 TAURI_SIGNING_PRIVATE_KEY / _PASSWORD 已正确配置 —— 空签名的更新包会被 tauri-plugin-updater 拒绝。"
           }
+          $signature = (Get-Content $sig.FullName -Raw).Trim()
+          Write-Host "Signature found: $($sig.Name)"
 
           $manifest = [ordered]@{
             version   = $version
