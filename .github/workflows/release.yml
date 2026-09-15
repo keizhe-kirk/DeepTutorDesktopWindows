@@ -101,13 +101,15 @@ jobs:
           "nsis=$($nsis.FullName)" >> $env:GITHUB_OUTPUT
           Write-Host "latest.json generated for v$version"
 
+      # 只出 NSIS,所以这里不再匹配 msi/*.msi(那个 glob 永远为空,只会在日志里刷警告)。
+      # 一并上传 .sig,方便用户自行校验更新包签名。
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
           name: windows-installer
           path: |
-            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
             src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
             latest.json
 
       - name: Create GitHub Release
@@ -115,8 +117,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
             src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe.sig
             latest.json
           draft: false
           prerelease: false
