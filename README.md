@@ -30,17 +30,24 @@ WebView2 窗口 ──http://127.0.0.1:3782──> Next.js 16 standalone ──/
 | 窗口与渲染 | Tauri 2 + WebView2(Win10/11 内置 Edge) |
 | 系统层 | Rust 1.78+(stable) |
 | 前端壳 UI | React 18 + TypeScript + Vite(仅 1 页启动/状态 UI,主界面用 WebView 回环加载) |
-| Python 后端 | 来自 `HKUDS/DeepTutor`,通过 pip install 引导,**不修改主项目** |
+| Python 后端 | 来自 `HKUDS/DeepTutor`,**随安装包内置**(自带 CPython,不修改主项目) |
+| 前端运行时 | **随安装包内置** Node.js,用于跑 deeptutor 附带的 Next.js standalone |
 | 推理侧 | LM Studio(Ollama / vLLM 同协议) |
+
+> **自包含设计**:正式安装包内含 `runtimes\python`(relocatable CPython + deeptutor 及其全部依赖)
+> 与 `runtimes\node`(node.exe)。**终端用户无需预装 Python、pip 或 Node.js**,装完即用。
+> 壳层优先使用内置运行时,找不到时才回退到系统 Python(便于 `tauri dev` 与排障)。
 
 ---
 
 ## 开发前置
 
+> **只使用安装包的用户什么都不需要装。** 下面这些是"想自己编译"才需要的。
+
 - Node.js 20+(推荐 22)
 - pnpm 10+
 - Rust stable(通过 `rustup` 安装,profile = default)
-- Python 3.11+(DeepTutor 主项目要求)
+- Python 3.11+ —— **可选**,仅在开发模式下回退使用;打包时会自动下载内置解释器
 - Windows 10 1903+(WebView2 Runtime 内置)或手动安装 evergreen runtime
 
 ### 推荐 Rust 安装命令
@@ -59,21 +66,38 @@ Invoke-WebRequest -UseBasicParsing https://static.rust-lang.org/rustup/dist/x86_
 ```bash
 # 1. 克隆并进入
 cd D:\code
-git clone https://github.com/HKUDS/DeepTutorDesktopWin.git
-cd DeepTutorDesktopWin
+git clone https://github.com/keizhe-kirk/DeepTutorDesktopWindows.git
+cd DeepTutorDesktopWindows
 
 # 2. 安装前端壳 UI 依赖
 pnpm install
 
-# 3. 引导 DeepTutor 主项目(pip 安装 deeptutor)
-pwsh -ExecutionPolicy Bypass -File scripts\bootstrap-python.ps1
-
-# 4. 开发模式(自动启动 Tauri + Rust 热重载 + WebView 直连 DeepTutor 后端)
+# 3. 开发模式(自动启动 Tauri + Rust 热重载 + WebView 直连 DeepTutor 后端)
+#    这一步会回退到系统 Python;若系统没有 deeptutor,先跑 scripts\bootstrap-python.ps1
 pnpm tauri dev
 
-# 5. 生产构建(产出 .msi + .exe 安装包到 src-tauri\target\release\bundle\)
-pnpm tauri build
+# 4. 生产构建:先把内置运行时组装到 src-tauri\runtimes\(约 600 MB,只需做一次)
+pwsh -ExecutionPolicy Bypass -File scripts\fetch-runtimes.ps1
+#    国内加速: 追加 -IndexUrl https://pypi.tuna.tsinghua.edu.cn/simple
+
+# 5. 出安装包(NSIS .exe,落到 src-tauri\target\release\bundle\nsis\)
+pnpm tauri build --bundles nsis
 ```
+
+<details>
+<summary><code>fetch-runtimes.ps1</code> 做什么</summary>
+
+| 步骤 | 内容 |
+|------|------|
+| 下载 | python-build-standalone 的 relocatable CPython 3.13(win x64) |
+| 解压 | 剥掉顶层目录,落到 `src-tauri/runtimes/python/` |
+| 安装 | 用该解释器执行 `pip install deeptutor==X.Y.Z`,依赖与前端产物(`deeptutor_web`)一并装进它自己的 `Lib/site-packages` |
+| 下载 | Node.js 官方单文件 `node.exe`,落到 `src-tauri/runtimes/node/` |
+
+产物已被 `.gitignore` 忽略;`bundle.resources` 会把整个 `runtimes/` 打进安装包。
+升级内置 deeptutor 只需 `pwsh ... -DeepTutorSpec "deeptutor==1.6.9" -Force`。
+
+</details>
 
 ---
 
@@ -82,11 +106,16 @@ pnpm tauri build
 壳层启动后按这条状态机推进,每一步都会把 `backend://state` 事件推给启动页:
 
 ```
-LocatingPython   探测 Python(DEEPTUTOR_PYTHON → PATH → py -3.xx → 常见安装路径),要求 >= 3.11
+BundledRuntimes  定位安装包内置运行时(DEEPTUTOR_RUNTIMES → 资源目录/runtimes → exe 同级/runtimes)
+      │
+LocatingPython   探测解释器(DEEPTUTOR_PYTHON → **内置 python.exe** → PATH → py -3.xx → 常见安装路径),要求 >= 3.11
       │
 CheckingDeps     用 importlib.util.find_spec('deeptutor') 检查后端包
       │
-Starting         python -m deeptutor.api.run_server(Windows 下 CREATE_NO_WINDOW,UTF-8/无缓冲)
+Starting         python -m deeptutor start --no-browser(Windows 下 CREATE_NO_WINDOW,UTF-8/无缓冲)
+      │          · 子进程 PATH 最前面插入 runtimes\node → deeptutor 的 shutil.which("node") 命中内置 Node
+      │          · 注入 DEEPTUTOR_HOME=%LOCALAPPDATA%\DeepTutor,运行数据不再污染用户主目录
+      │          · 注入 PYTHONPYCACHEPREFIX,避免向只读的 Program Files 写 __pycache__
       │          stdout/stderr 逐行 emit `backend://log`,UI 实时滚动
 Probing          每 500ms 探 :8001(/docs → /api/health → /health → /)与 :3782(/)
       │
@@ -94,17 +123,18 @@ Ready            WebView 导航到 http://127.0.0.1:<web_port>
    └─ 任一环节失败 → Failed,UI 给出可执行修复建议 + 一键重试
 ```
 
-> **注意**:DeepTutor 主项目默认 `deeptutor start` 同时起后端(:8001)+ 前端(:3782),
-> 但桌面壳**只起后端**(壳层自带 WebView2 负责前端显示),因此使用 `deeptutor.api.run_server` 模块。
-> 如需同时起前端(调试/开发),可设 `DEEPTUTOR_MODULE=deeptutor` + `DEEPTUTOR_ARGS=start`。
+> **注意**:`deeptutor start --no-browser` 会同时起后端(:8001)与前端(:3782),
+> `--no-browser` 阻止它自己弹系统浏览器 —— 界面由壳层的 WebView2 显示。
 
 ### 启动配置(全部可用环境变量覆盖)
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `DEEPTUTOR_PYTHON` | 自动探测 | 直接指定解释器路径 |
-| `DEEPTUTOR_MODULE` | `deeptutor.api.run_server` | `python -m <module>`(DeepTutor 真实后端入口) |
-| `DEEPTUTOR_ARGS` | 空 | 传给模块的参数(run_server 不需要) |
+| `DEEPTUTOR_RUNTIMES` | 自动探测 | 直接指定内置运行时目录(内含 `python/` 与 `node/`) |
+| `DEEPTUTOR_PYTHON` | 自动探测 | 直接指定解释器路径(优先级高于内置运行时) |
+| `DEEPTUTOR_HOME` | `%LOCALAPPDATA%\DeepTutor` | deeptutor 运行数据根目录;用户已设置时不覆盖 |
+| `DEEPTUTOR_MODULE` | `deeptutor` | `python -m <module>` |
+| `DEEPTUTOR_ARGS` | `start --no-browser` | 传给模块的参数 |
 | `DEEPTUTOR_BACKEND_SCRIPT` | 空 | 直接跑某个 .py(调试 / mock 用) |
 | `DEEPTUTOR_API_PORT` | `8001` | FastAPI 端口 |
 | `DEEPTUTOR_WEB_PORT` | `3782` | Next.js 端口 |

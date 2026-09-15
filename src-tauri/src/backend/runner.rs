@@ -20,6 +20,7 @@ use tokio::sync::oneshot;
 use super::config::BackendConfig;
 use super::health::Health;
 use super::python::PythonLocator;
+use super::runtime::{self, BundledRuntimes};
 
 pub const EVENT_STATE: &str = "backend://state";
 pub const EVENT_LOG: &str = "backend://log";
@@ -147,6 +148,8 @@ struct Supervisor {
 pub struct Runner {
     sink: Sink,
     sup: Mutex<Option<Supervisor>>,
+    /// 安装包内置运行时(自包含安装包携带的 Python / Node)。
+    bundled: Mutex<BundledRuntimes>,
 }
 
 impl Runner {
@@ -163,12 +166,23 @@ impl Runner {
                 pid: Arc::new(RwLock::new(None)),
             },
             sup: Mutex::new(None),
+            bundled: Mutex::new(BundledRuntimes::default()),
         }
     }
 
     /// 绑定 AppHandle(用于 emit 事件)。必须在 setup 阶段调用。
     pub fn attach(&mut self, app: AppHandle) {
         self.sink.app = Some(app);
+    }
+
+    /// 登记安装包内置运行时。必须在 setup 阶段调用(早于 boot::spawn)。
+    pub fn set_bundled(&self, bundled: BundledRuntimes) {
+        *self.bundled.lock() = bundled;
+    }
+
+    /// 取一份内置运行时快照。
+    pub fn bundled(&self) -> BundledRuntimes {
+        self.bundled.lock().clone()
     }
 
     // ---- 只读访问 ----
@@ -224,10 +238,13 @@ impl Runner {
             let _ = self.stop().await;
         }
 
+        let bundled = self.bundled();
+
         *self.sink.python.write() = Some(format!(
-            "{} ({})",
+            "{} ({}) [{}]",
             py.executable.display(),
-            py.display_version()
+            py.display_version(),
+            py.source_label()
         ));
 
         let mut cmd = Command::new(&py.executable);
@@ -255,6 +272,59 @@ impl Runner {
             cmd.env(k, v);
         }
 
+        // 内置 Node 必须前置到 PATH:deeptutor 用 `shutil.which("node")` 定位前端运行时,
+        // 放在最前面才能盖过用户机器上可能存在的旧版 Node,保证自包含。
+        if let Some(node_dir) = bundled.node_dir() {
+            let mut paths = vec![node_dir.clone()];
+            if let Some(existing) = std::env::var_os("PATH") {
+                paths.extend(std::env::split_paths(&existing));
+            }
+            match std::env::join_paths(paths) {
+                Ok(joined) => {
+                    cmd.env("PATH", &joined);
+                    self.sink.push_log(
+                        "shell",
+                        format!("内置 Node 已前置到子进程 PATH: {}", node_dir.display()),
+                    );
+                }
+                Err(e) => self.sink.push_log(
+                    "shell",
+                    format!("警告:合并 PATH 失败,内置 Node 可能不生效: {}", e),
+                ),
+            }
+        }
+
+        // deeptutor 默认把运行数据写到 `<cwd>/data`(见 runtime/home.py)。
+        // 显式指向用户级目录,避免安装版把 data/ 撒进用户主目录,
+        // 同时避开 Program Files 的只读属性。
+        let data_home = match runtime::runtime_home_override() {
+            Some(dir) => match std::fs::create_dir_all(&dir) {
+                Ok(()) => {
+                    cmd.env(runtime::ENV_DEEPTUTOR_HOME, &dir);
+                    self.sink
+                        .push_log("shell", format!("运行数据目录: {}", dir.display()));
+                    Some(dir)
+                }
+                Err(e) => {
+                    self.sink.push_log(
+                        "shell",
+                        format!("警告:无法创建数据目录 {}: {}", dir.display(), e),
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+
+        // 内置解释器装在 Program Files 下(普通用户不可写),Python 导入模块时
+        // 尝试写 __pycache__ 会失败并退化为"每次启动都重新编译",拖慢启动。
+        // 把字节码缓存重定向到用户目录,顺便避免污染安装目录。
+        if py.bundled {
+            if let Some(dir) = dirs::data_local_dir().map(|d| d.join("DeepTutor").join("pycache")) {
+                cmd.env("PYTHONPYCACHEPREFIX", dir);
+            }
+        }
+
         cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -264,9 +334,10 @@ impl Runner {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
 
-        // 设置工作目录为用户主目录(避免在 System32 下创建文件)
-        if let Some(home) = dirs::home_dir() {
-            cmd.current_dir(home);
+        // 设置工作目录:优先落在可写的运行数据目录(否则子进程的相对路径写入
+        // 可能落到 System32 这类无权限位置),拿不到时退回用户主目录。
+        if let Some(dir) = data_home.or_else(dirs::home_dir) {
+            cmd.current_dir(dir);
         }
 
         let mut child = cmd.spawn().map_err(|e| {

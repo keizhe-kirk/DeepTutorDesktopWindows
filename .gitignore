@@ -17,6 +17,9 @@ build/
 *.exe
 *.msi
 
+# 由 scripts/fetch-runtimes.ps1 组装的自包含运行时(内置 Python + Node,数百 MB,不进 git)
+src-tauri/runtimes/
+
 # DeepTutor 运行时配置(deeptutor.api.run_server 自动创建)
 data/
 

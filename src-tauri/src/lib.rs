@@ -6,7 +6,9 @@
 //!
 //! 业务分工:
 //! - main.rs        : crate 入口(windows_subsystem = "windows")
-//! - backend/*      : Python 子进程管理(deeptutor start --child)
+//! - backend/*      : Python 子进程管理(deeptutor start --no-browser)
+//!                    其中 runtime.rs 负责定位安装包内置的 Python / Node,
+//!                    使正式安装包不依赖用户机器上的运行时
 //! - lmstudio/*     : LM Studio 桥接(模型列表/加载/卸载)
 //! - ima/*          : 腾讯 IMA 自定义协议与桥接
 //! - tray.rs        : 系统托盘菜单
@@ -23,6 +25,7 @@ use std::sync::Arc;
 use tauri::Manager;
 
 use backend::runner::Runner;
+use backend::BundledRuntimes;
 
 /// 启动器:构建并运行 Tauri 应用。
 pub fn run() {
@@ -52,6 +55,13 @@ pub fn run() {
         .setup(|app| {
             let mut runner = Runner::new();
             runner.attach(app.handle().clone());
+
+            // 解析安装包内置运行时:自包含安装包携带 Python + Node,
+            // 用户机器上无需预装任何东西。解析不到时退回系统 Python(开发场景)。
+            let bundled = BundledRuntimes::detect(app.path().resource_dir().ok());
+            log::info!("{}", bundled.describe());
+            runner.set_bundled(bundled);
+
             let runner = Arc::new(runner);
             app.manage(runner);
 

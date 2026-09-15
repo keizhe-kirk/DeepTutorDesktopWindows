@@ -36,9 +36,27 @@ jobs:
       - name: Install frontend deps
         run: pnpm install
 
+      # 组装自包含运行时:内置 CPython + deeptutor(含前端产物) + Node.js。
+      # 产物落在 src-tauri/runtimes/,会被 bundle.resources 打进安装包,
+      # 最终用户无需预装 Python 或 Node.js。
+      - name: Cache assembled runtimes
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache/runtimes
+            src-tauri/runtimes
+          key: runtimes-${{ runner.os }}-${{ hashFiles('scripts/fetch-runtimes.ps1') }}-${{ hashFiles('requirements-shell.txt') }}
+
+      - name: Assemble self-contained runtimes (Python + Node + deeptutor)
+        shell: pwsh
+        run: ./scripts/fetch-runtimes.ps1
+
       # 设置了 TAURI_SIGNING_PRIVATE_KEY 时,tauri build 会自动对产物签名并生成 .sig
-      - name: Build Tauri bundle (MSI + NSIS, signed)
+      # 只出 NSIS:MSI(WiX) 打包数千个运行时文件既慢又容易失败,且与 updater 的
+      # passive 安装模式配合不如 NSIS。
+      - name: Build Tauri bundle (NSIS, signed)
         run: pnpm tauri build --target x86_64-pc-windows-msvc
+        timeout-minutes: 120
 
       - name: Generate updater manifest (latest.json)
         id: manifest

@@ -13,8 +13,9 @@ use super::python;
 use super::runner::{Runner, Stage, State};
 
 const HINT_NO_PYTHON: &str =
-    "请安装 Python 3.11+ 并勾选 \"Add Python to PATH\",或用环境变量 DEEPTUTOR_PYTHON 直接指定解释器路径。";
-const HINT_NO_DEEPTUTOR: &str = "请先安装 DeepTutor 后端:在 DeepTutor 仓库根目录执行 pip install -e . ,或运行本项目 scripts\\bootstrap-python.ps1 完成一键引导。";
+    "正式安装包自带内置 Python,出现此错误通常意味着安装不完整(runtimes 目录缺失)。请重新安装 DeepTutor;开发环境可用环境变量 DEEPTUTOR_PYTHON 指定解释器。";
+const HINT_NO_DEEPTUTOR: &str =
+    "正式安装包自带的 deeptutor 未就绪,安装可能不完整。请重新安装 DeepTutor;开发环境可在项目根目录执行 scripts\\bootstrap-python.ps1 完成一键引导。";
 const HINT_TIMEOUT: &str =
     "后端进程已拉起但服务未就绪。请看下方日志定位;常见原因是端口被占用、依赖缺失或首次构建 Next.js 较慢。";
 
@@ -38,13 +39,20 @@ pub async fn run(_app: AppHandle, runner: Arc<Runner>) {
     let cfg = BackendConfig::from_env();
     let _ = runner.stop().await;
 
-    // 1) 探测 Python
+    // 0) 报告内置运行时状态 —— 自包含安装包里这应当是"就绪"
+    let bundled = runner.bundled();
+    runner.push_log("shell", bundled.describe());
+    if let Some(root) = bundled.root() {
+        runner.push_log("shell", format!("内置运行时目录: {}", root.display()));
+    }
+
+    // 1) 探测 Python(内置解释器优先于系统 Python)
     runner.set(
         Stage::LocatingPython,
         State::Booting,
         "正在探测 Python 解释器...",
     );
-    let py = match python::locate(cfg.min_python).await {
+    let py = match python::locate(cfg.min_python, Some(&bundled)).await {
         Ok(p) => p,
         Err(e) => {
             fail(&runner, e.to_string(), HINT_NO_PYTHON);
@@ -54,7 +62,8 @@ pub async fn run(_app: AppHandle, runner: Arc<Runner>) {
     runner.push_log(
         "shell",
         format!(
-            "Python {} @ {}",
+            "使用{} Python {} @ {}",
+            if py.bundled { "内置" } else { "系统" },
             py.display_version(),
             py.executable.display()
         ),
