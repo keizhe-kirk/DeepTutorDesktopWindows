@@ -82,20 +82,27 @@ jobs:
           $bundleRoot = "src-tauri\target\x86_64-pc-windows-msvc\release\bundle"
           $nsis = Get-ChildItem -Path $bundleRoot -Recurse -Filter "*.exe" |
             Where-Object { $_.FullName -match 'nsis' } | Select-Object -First 1
-          $sig = Get-ChildItem -Path $bundleRoot -Recurse -Filter "*.sig" -ErrorAction SilentlyContinue | Select-Object -First 1
           if (-not $nsis) { throw "NSIS bundle not found" }
 
+          # 精确匹配 <installer>.exe.sig。不要用"递归取第一个 *.sig":
+          # 一旦将来多出别的签名产物(如 msi/*.msi.sig),就会把错误的签名写进 manifest,
+          # 导致用户侧校验失败且极难排查。
+          $sig = Get-Item -LiteralPath "$($nsis.FullName).sig" -ErrorAction SilentlyContinue
           $tag = $env:GITHUB_REF -replace 'refs/tags/',''
           $repo = $env:GITHUB_REPOSITORY
           $url = "https://github.com/$repo/releases/download/$tag/$($nsis.Name)"
           $pubDate = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
 
           # 硬失败:宁可不发版,也不发一个 signature 为空、自动更新装不上的版本。
+          # (Windows NSIS 的更新产物就是安装包本身 exe + exe.sig,由 createUpdaterArtifacts 生成)
           if (-not $sig) {
-            throw "未找到签名文件 (*.exe.sig)。请确认 TAURI_SIGNING_PRIVATE_KEY / _PASSWORD 已正确配置 —— 空签名的更新包会被 tauri-plugin-updater 拒绝。"
+            throw "未找到签名文件 $($nsis.Name).sig。请确认 tauri.conf.json 里 bundle.createUpdaterArtifacts=true,且 TAURI_SIGNING_PRIVATE_KEY / _PASSWORD 已正确配置 —— 空签名的更新包会被 tauri-plugin-updater 拒绝。"
           }
           $signature = (Get-Content $sig.FullName -Raw).Trim()
-          Write-Host "Signature found: $($sig.Name)"
+          if ([string]::IsNullOrWhiteSpace($signature)) {
+            throw "签名文件 $($sig.Name) 内容为空。"
+          }
+          Write-Host "Signature found: $($sig.Name) ($($signature.Length) chars)"
 
           $manifest = [ordered]@{
             version   = $version

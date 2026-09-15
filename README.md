@@ -1,21 +1,50 @@
 # DeepTutor Desktop for Windows
 
-**DeepTutor 的 Windows 原生外壳**,与 HKUDS/DeepTutorDesktop (macOS, Swift) 平行设计。
-零侵入 DeepTutor 主仓库——所有集成通过子进程 + HTTP/WebSocket + 自定义协议完成。
+[![Release](https://img.shields.io/github/v/release/keizhe-kirk/DeepTutorDesktopWindows?label=release&color=2ea3a3)](https://github.com/keizhe-kirk/DeepTutorDesktopWindows/releases/latest)
+[![Build](https://img.shields.io/github/actions/workflow/status/keizhe-kirk/DeepTutorDesktopWindows/release.yml?label=build)](https://github.com/keizhe-kirk/DeepTutorDesktopWindows/actions)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](./LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4?logo=windows)](#)
+
+**DeepTutor 的 Windows 原生桌面端** —— 与 HKUDS/DeepTutorDesktop (macOS, Swift) 平行设计,
+零侵入 DeepTutor 主仓库:所有集成通过子进程 + HTTP/WebSocket + 自定义协议完成。
 
 > 主项目:https://github.com/HKUDS/DeepTutor
 > 平行参考(macOS):https://github.com/HKUDS/DeepTutorDesktop
+
+## ⬇️ 下载安装
+
+到 **[Releases](https://github.com/keizhe-kirk/DeepTutorDesktopWindows/releases/latest)** 下载
+`DeepTutor_<版本>_x64-setup.exe`,双击安装即可。
+
+> ### 🎁 免依赖:安装包里已经装好一切
+>
+> **不需要预装 Python、pip、Node.js,也不需要装任何 VC++ 运行库。**
+> 安装包约 225 MB —— 因为它真的把整套运行时搬了进去:
+>
+> | 内置组件 | 版本/体积 | 作用 |
+> |---|---|---|
+> | relocatable CPython | 3.13(约 45 MB) | 跑 DeepTutor 后端 |
+> | `deeptutor` 及其全部依赖 | 含 Next.js 前端产物(约 400 MB) | FastAPI 后端 + Web UI |
+> | Node.js | v22 LTS 单文件 `node.exe`(约 84 MB) | 跑 deeptutor 附带的 Next.js standalone |
+>
+> 壳层优先使用**内置**运行时,探测不到时才回退系统环境(方便 `tauri dev` 与排障,
+> 可用 `DEEPTUTOR_RUNTIMES` 覆盖)。
+>
+> 安装后运行数据落在 `%LOCALAPPDATA%\DeepTutor`,不污染用户主目录;
+> 应用内置自动更新,后续版本一键升级。
+
+**系统要求**:Windows 10 1903+ / Windows 11,64 位。WebView2 运行时就绪(Win11 及新版 Win10 已内置)。
 
 ---
 
 ## 架构一句话
 
 ```
-WebView2 窗口 ──http://127.0.0.1:3782──> Next.js 16 standalone ──/api/* ws/*──> FastAPI :8001 (Python 3.11+)
+WebView2 窗口 ──http://127.0.0.1:3782──> Next.js 16 standalone ──/api/* ws/*──> FastAPI :8001 (内置 CPython 3.13)
    │                                       │
    │                                       └──> LM Studio :1234 / Ollama / vLLM (OpenAI 兼容)
    │
-   └──>  Tauri 2 (Rust) ──> deeptutor start --child (子进程管理 + 日志回灌)
+   └──>  Tauri 2 (Rust) ──> deeptutor start --child (子进程管理 + 日志回灌 + 作业对象兜底)
                       └──> LM Studio 模型管理 / 腾讯 IMA 自定义协议 / 系统托盘
 ```
 
@@ -225,15 +254,29 @@ DeepTutorDesktopWin/
 
 ---
 
-## 里程碑(M0/M1/M2/M3)
+## 里程碑
 
-- **M0** ✅ 脚手架就绪:Rust 工程 + Tauri 配置 + 模块占位
-- **M1** ✅ 后端拉起 + 启动页:Python 引导、`deeptutor start --child`、健康探测、UI 启动动画
-- **M2** ✅ LM Studio + 托盘:模型列表/加载/卸载(原生 `/api/v0/*`)、托盘菜单、启动页模型管理面板
-- **M3** ✅ 打包 + 自动更新:NSIS 安装包已可产出;签名密钥 + `latest.json` + 前端检查更新已接入
-- **M4** ✅ 正式图标:毕业帽 + 神经节点 + 青蓝渐变(`assets/logo-source.png` → `tauri icon` 多尺寸 RGBA + ICO);启动页与 splash 都已引用;MSI 待 CI 环境(本地 light.exe 被杀软锁)
+| 里程碑 | 内容 | 状态 |
+|--------|------|------|
+| **M0** | 脚手架就绪:Rust 工程 + Tauri 配置 + 模块占位 | ✅ |
+| **M1** | 后端拉起 + 启动页:Python 探测、`deeptutor start --no-browser`、双端口健康探测、UI 启动动画 | ✅ |
+| **M2** | LM Studio + 托盘:模型列表/加载/卸载(原生 `/api/v0/*`)、托盘菜单、启动页模型管理面板 | ✅ |
+| **M3** | 打包 + 自动更新:NSIS 安装包、`latest.json`、前端检查更新 | ✅ |
+| **M4** | 正式图标:毕业帽 + 神经节点 + 青蓝渐变(`tauri icon` 多尺寸 RGBA + ICO) | ✅ |
+| **M5** | 自包含安装包 + 进程生命周期根治(**当前版本 v0.2.1**) | ✅ |
 
-当前进度:**M3 + M4 完成(MSI 在 CI 上跑)**
+**M5 做了两件大事:**
+
+1. **真·自包含** —— 安装包内置 relocatable CPython 3.13 + deeptutor(含前端产物)+ Node.js v22,
+   终端用户零前置依赖。安装包从 2.5 MB 涨到 225 MB,涨的这部分就是运行时。
+   新增 `scripts/fetch-runtimes.ps1`(幂等、带缓存、会强校验 `deeptutor_web/server.js` 是否随 wheel 落地)
+   与 `src-tauri/src/backend/runtime.rs`(`BundledRuntimes::detect`,多候选目录容错)。
+2. **关窗口 = 关后端** —— 修复"关掉窗口后 python/node 仍占着 8001/3782 变成孤儿进程"。
+   三道防线见下文[窗口与后端的生命周期绑定](#窗口与后端的生命周期绑定),其中
+   Windows **作业对象**(`KILL_ON_JOB_CLOSE`)由内核保证:壳进程一消失,整棵子进程树连带回收,
+   覆盖强杀/崩溃/panic 等所有用户态回调来不及执行的路径。
+
+MSI 目标保留在配置中但暂不上——本地 `light.exe` 被杀软锁,NSIS 已满足分发需求。
 
 ---
 
@@ -258,27 +301,41 @@ cp src-tauri/icons/32x32.png   public/favicon.png
 
 ---
 
-## 自动更新(M3)
+## 自动更新
 
-壳层通过 `tauri-plugin-updater` 走 GitHub Releases 自动更新:
+壳层通过 `tauri-plugin-updater` 走 GitHub Releases 自动更新。**三个条件缺一不可**,
+任何一个没配好都会退化成"能打包但更新装不上":
 
-| 环节 | 说明 |
-|------|------|
-| 签名密钥 | `D:\deeptutor-setup\deeptutor-updater.key`(私钥,勿泄露/勿提交)与 `.key.pub`(公钥已写入 `tauri.conf.json` 的 `plugins.updater.pubkey`) |
-| 更新源 | `https://github.com/HKUDS/DeepTutorDesktopWin/releases/latest/download/latest.json` |
-| 签名环境变量 | CI 里用 `TAURI_SIGNING_PRIVATE_KEY` + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`(密码:`deeptutor-release-2026`) |
-| 前端入口 | 启动页右下"检查更新"按钮 → `check_for_update` / `install_update` 命令 |
+| 环节 | 要求 | 位置 |
+|------|------|------|
+| ① 打包开关 | `bundle.createUpdaterArtifacts: true` —— 不开就**不会生成 `.sig`**,即使配了密钥也没用 | `src-tauri/tauri.conf.json` |
+| ② 签名密钥 | `TAURI_SIGNING_PRIVATE_KEY` + `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` 两个 CI secret,均**不可为空** | GitHub → Settings → Secrets → Actions |
+| ③ 公钥 | 与私钥配对的公钥(base64) | `tauri.conf.json` → `plugins.updater.pubkey` |
+| 更新源 | `https://github.com/keizhe-kirk/DeepTutorDesktopWindows/releases/latest/download/latest.json` | `tauri.conf.json` → `plugins.updater.endpoints` |
+| 前端入口 | 启动页"检查更新"按钮 → `check_for_update` / `install_update` 两个自定义命令 | `src/App.tsx` → `lib.rs` |
+
+> 密钥文件请放在仓库外(如 `~/.tauri/`),**绝不要提交**;密码只写在 GitHub Secrets 里,
+> 不要出现在任何文档或聊天记录中。
+>
+> 本地生成密钥对:
+> ```bash
+> npx @tauri-apps/cli@^2 signer generate -w ~/.tauri/deeptutor.key
+> ```
+> 用 `-p ""`(空密码)会让 `signer sign` 等待 stdin 而挂起,而 GitHub Secrets 又不接受空值 ——
+> 因此**务必设置非空密码**。
 
 **发布新版本步骤:**
 
-1. 在 GitHub 仓库 Settings → Secrets → Actions 添加:
-   - `TAURI_SIGNING_PRIVATE_KEY`:`D:\deeptutor-setup\deeptutor-updater.key` 文件内容
-   - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`:`deeptutor-release-2026`
-2. 改 `package.json` / `src-tauri/Cargo.toml` / `tauri.conf.json` 三处版本号一致
-3. `git tag v0.1.1 && git push --tags` → 触发 CI 出包 + 签名 + 生成 `latest.json` 并上传 release
-4. 已安装用户下次点"检查更新"即可收到提示并一键升级
+1. 三个版本号改齐:`package.json` / `src-tauri/Cargo.toml`(+ `Cargo.lock`)/ `src-tauri/tauri.conf.json`
+2. 提交并推送到 `main`
+3. `git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z` → 触发 CI:`fetch-runtimes.ps1` 组装运行时 → 构建签名 NSIS → 生成 `latest.json` → 建 Release
+4. **验收**:Release 里必须能看到 `DeepTutor_X.Y.Z_x64-setup.exe`、`.exe.sig`、`latest.json`,
+   且 `latest.json` 的 `signature` 字段**非空**。CI 已内置硬校验,缺签名会直接失败而不会静默发出坏包。
 
-> 本地想手动签名单个文件:`pnpm tauri signer sign -f <私钥路径> -p <密码> <file>`
+> 本地手动签名单个文件:`npx @tauri-apps/cli@^2 signer sign -f <私钥> -p <密码> <file>`
+>
+> ⚠️ 历史包袱:v0.1.x ~ v0.2.0 的更新包签名是空的(缺 `createUpdaterArtifacts` + 无密钥),
+> 这些版本**无法自动更新**,需要手动装一次 v0.2.1 及以后版本,之后才能接力自动升级。
 
 ---
 
