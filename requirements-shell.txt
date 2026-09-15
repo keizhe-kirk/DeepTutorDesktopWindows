@@ -1,6 +1,7 @@
 # DeepTutor Shell 专属 Python 依赖
 # 主项目依赖(deeptutor)由 scripts/bootstrap-python.ps1 引导安装
 # 这里只放壳层额外需要的工具(可选)
-#
-# 当前为占位文件,如需添加例如 pdf 处理等工具,在此列出
-# pypdf>=4.0
+
+# DeepTutor 主包 - 已更新至 v1.6.8 (2026-09-14)
+# 功能增强: 回收站、历史搜索、知识边界工具、修复多项静默失败问题
+deeptutor>=1.6.8
