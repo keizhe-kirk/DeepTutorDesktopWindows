@@ -126,6 +126,23 @@ Ready            WebView 导航到 http://127.0.0.1:<web_port>
 > **注意**:`deeptutor start --no-browser` 会同时起后端(:8001)与前端(:3782),
 > `--no-browser` 阻止它自己弹系统浏览器 —— 界面由壳层的 WebView2 显示。
 
+### 窗口与后端的生命周期绑定
+
+后端是一条进程链(`python -m deeptutor start` → `uvicorn` / `node server.js`),
+清理不干净就会变成占着端口的孤儿进程,下次启动静默连到旧服务上。三道防线:
+
+| 防线 | 机制 | 覆盖场景 |
+|------|------|----------|
+| 1. 关闭主窗口 | `CloseRequested` 上同步杀进程树后 `app.exit(0)` | 用户点 X |
+| 2. 正常退出 | `RunEvent::Exit` → `kill_tree_sync()` | 托盘"退出"、`app.exit()` |
+| 3. **作业对象**(根治) | 子进程加入 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` 作业;壳进程一死,内核连带结束整棵树 | 任务管理器强杀、崩溃、`panic = "abort"`、更新器接管后 `process::exit` |
+
+第 3 条是关键:**它不依赖任何用户态回调,因此无法被绕过**。
+另外启动时会读取上次记录的 pid,回收旧版本遗留的孤儿进程(仅当存活进程的
+映像路径与记录完全一致时才动手,避免 PID 复用误杀)。
+
+> 语义约定:点 X = 退出应用(连带停后端);只想隐藏窗口请用托盘的"打开/隐藏主窗口"。
+
 ### 启动配置(全部可用环境变量覆盖)
 
 | 变量 | 默认值 | 说明 |
@@ -166,22 +183,30 @@ DeepTutorDesktopWin/
 │  ├─ src/
 │  │  ├─ main.rs               # 入口
 │  │  ├─ backend/              # Python 子进程管理
+│  │  │  ├─ config.rs          #   启动配置(环境变量可覆盖)
+│  │  │  ├─ runtime.rs         #   内置运行时(Python/Node)定位
+│  │  │  ├─ winproc.rs         #   作业对象 + 进程映像查询(退出兜底)
+│  │  │  ├─ python.rs          #   解释器探测
+│  │  │  ├─ runner.rs          #   子进程生命周期
+│  │  │  ├─ health.rs          #   双端口健康探测
+│  │  │  └─ boot.rs            #   启动状态机
 │  │  ├─ lmstudio/             # LM Studio 客户端
 │  │  ├─ ima/                  # 腾讯 IMA 桥接
 │  │  ├─ tray.rs               # 系统托盘
 │  │  └─ autostart.rs          # 注册表自启动
+│  ├─ runtimes/                # 内置运行时(由 fetch-runtimes.ps1 生成,git 忽略)
+│  │  ├─ python/               #   CPython + deeptutor 及其依赖 + 前端产物
+│  │  └─ node/                 #   node.exe
 │  ├─ tauri.conf.json
 │  ├─ capabilities/            # Tauri 2 capabilities 授权
 │  └─ Cargo.toml
 ├─ src/                        # 壳层 React UI(启动页/状态面板)
 ├─ scripts/
-│  ├─ bootstrap-python.ps1    # Python 环境引导 + deeptutor 安装
+│  ├─ fetch-runtimes.ps1      # 组装内置 Python + deeptutor + Node(打包必跑)
+│  ├─ bootstrap-python.ps1    # 开发模式:引导系统 Python 环境(可选)
 │  └─ fetch-web.ps1           # 拉取/同步 DeepTutor web 资源(可选)
-├─ installer/                  # 安装包模板
-│  ├─ wix/
-│  └─ nsis/
 ├─ .github/workflows/
-│  └─ release.yml             # tag 触发,出 MSI + NSIS + auto-update json
+│  └─ release.yml             # tag 触发,组装运行时 → 出 NSIS + auto-update json
 ├─ ARCHITECTURE.md             # 架构详细说明
 └─ README.md
 ```

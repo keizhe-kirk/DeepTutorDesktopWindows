@@ -36,6 +36,16 @@ dirs = "6"
 parking_lot = "0.12"
 which = "6"
 
+# Windows 作业对象(Job Object):保证壳进程消失时后端子进程树被内核一并回收。
+# 见 backend/winproc.rs 的模块文档。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
 [features]
 # 默认关闭自定义协议需要时启用
 default = []

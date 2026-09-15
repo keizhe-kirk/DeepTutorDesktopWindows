@@ -62,6 +62,10 @@ pub fn run() {
             log::info!("{}", bundled.describe());
             runner.set_bundled(bundled);
 
+            // 回收上一轮可能残留的后端进程(兼容从旧版本升级上来的用户:
+            // 那些孤儿进程会死占 8001/3782,让新实例静默连到旧服务上)。
+            runner.reap_stale_backend();
+
             let runner = Arc::new(runner);
             app.manage(runner);
 
@@ -72,6 +76,26 @@ pub fn run() {
             // 启动后端引导流程(异步,不阻塞窗口显示)
             backend::boot::spawn(app.handle());
             Ok(())
+        })
+        // 关闭主窗口 = 退出应用。
+        //
+        // 之前"关窗口 ≠ 关后端":窗口关了,`python -m deeptutor start` 那条进程链
+        // 仍在后台跑,死占 8001 / 3782,下次启动会静默连到旧服务上。
+        // 这里在关闭请求上显式清理,再退出;托盘的"打开/隐藏主窗口"仍用于隐藏窗口,
+        // 所以隐藏 ≠ 关闭,两者语义不再混淆。
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { .. } = event {
+                if window.label() != "main" {
+                    return;
+                }
+                let app = window.app_handle();
+                // 同步杀进程树 —— 此时 async runtime 可能已不再被驱动
+                if let Some(runner) = app.try_state::<Arc<Runner>>() {
+                    runner.kill_tree_sync();
+                }
+                log::info!("主窗口关闭,后端进程树已清理,应用退出");
+                app.exit(0);
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::ping,

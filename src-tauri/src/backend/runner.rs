@@ -5,13 +5,19 @@
 //! - stdout/stderr 各起一个 reader task,逐行 emit `backend://log`
 //! - supervisor task 用 `select!` 同时等"停止信号"和"子进程退出"
 //! - 停止时先 `child.kill()`,再用 `taskkill /PID /T /F` 清掉 Next.js/uvicorn 的孙进程
+//! - **退出兜底(关键)**:子进程会被加入一个 `KILL_ON_JOB_CLOSE` 作业对象。
+//!   壳进程无论以何种方式消失(正常退出 / 崩溃 / 被强杀 / 更新器 exit),
+//!   内核都会连带结束整棵后端进程树,不会留下死占端口的孤儿进程。
+//! - 启动时还会回收"上一轮残留下来的"后端进程(见 `reap_stale_backend`),
+//!   兼容旧版本遗留的孤儿进程。
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 
 use parking_lot::{Mutex, RwLock};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
@@ -21,6 +27,7 @@ use super::config::BackendConfig;
 use super::health::Health;
 use super::python::PythonLocator;
 use super::runtime::{self, BundledRuntimes};
+use super::winproc::{self, JobHandle};
 
 pub const EVENT_STATE: &str = "backend://state";
 pub const EVENT_LOG: &str = "backend://log";
@@ -150,6 +157,8 @@ pub struct Runner {
     sup: Mutex<Option<Supervisor>>,
     /// 安装包内置运行时(自包含安装包携带的 Python / Node)。
     bundled: Mutex<BundledRuntimes>,
+    /// 承载后端子进程树的作业对象。活到进程结束 —— Drop 即触发内核清理。
+    job: Mutex<Option<JobHandle>>,
 }
 
 impl Runner {
@@ -167,6 +176,7 @@ impl Runner {
             },
             sup: Mutex::new(None),
             bundled: Mutex::new(BundledRuntimes::default()),
+            job: Mutex::new(None),
         }
     }
 
@@ -183,6 +193,89 @@ impl Runner {
     /// 取一份内置运行时快照。
     pub fn bundled(&self) -> BundledRuntimes {
         self.bundled.lock().clone()
+    }
+
+    /// 确保作业对象就绪,并把 `pid` 登记进去。返回一句给用户看的日志。
+    ///
+    /// 登记成功后,壳进程无论以何种方式消失,内核都会连带结束该进程及其所有后代。
+    fn enroll_in_job(&self, pid: u32) -> String {
+        if pid == 0 {
+            return "警告:未拿到有效 pid,无法登记作业对象".to_string();
+        }
+        let mut guard = self.job.lock();
+        if guard.is_none() {
+            match JobHandle::new_kill_on_close() {
+                Ok(job) => *guard = Some(job),
+                Err(e) => {
+                    return format!("警告:创建作业对象失败,异常退出时可能残留后端进程: {e}");
+                }
+            }
+        }
+        match guard.as_ref().map(|job| job.assign_pid(pid)) {
+            Some(Ok(())) => "后端进程已纳入作业对象:壳退出时由内核连带回收".to_string(),
+            Some(Err(e)) => format!("警告:无法把后端进程纳入作业对象: {e}"),
+            None => "警告:作业对象不可用".to_string(),
+        }
+    }
+
+    /// 记录本轮拉起的后端进程,供下次启动回收残留。
+    fn write_pid_record(&self, pid: u32, exe: &std::path::Path) {
+        let Some(path) = pid_record_path() else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let record = PidRecord {
+            pid,
+            exe: exe.display().to_string(),
+        };
+        if let Ok(text) = serde_json::to_string(&record) {
+            if let Err(e) = std::fs::write(&path, text) {
+                self.push_log("shell", format!("警告:写入 pid 记录失败: {e}"));
+            }
+        }
+    }
+
+    fn clear_pid_record(&self) {
+        if let Some(path) = pid_record_path() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// 启动时回收"上一轮残留"的后端进程。
+    ///
+    /// 0.2.0 起后端子进程被纳入作业对象,正常路径不会再残留;这个兜底主要面向
+    /// 从旧版本(仅靠退出回调清理)升级上来的用户 —— 那些孤儿进程仍死占着
+    /// 8001 / 3782,会让新实例静默连到旧服务上。
+    ///
+    /// 只回收"映像路径与上次记录完全一致"的进程,避免 PID 复用后误杀无关进程。
+    pub fn reap_stale_backend(&self) {
+        let Some(path) = pid_record_path() else { return };
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            return;
+        };
+        let _ = std::fs::remove_file(&path);
+
+        let Ok(record) = serde_json::from_str::<PidRecord>(&text) else {
+            return;
+        };
+        if record.pid == 0 || record.pid == self.pid().unwrap_or(0) {
+            return;
+        }
+        let Some(live) = winproc::image_path(record.pid) else {
+            return;
+        };
+        if !winproc::same_executable(&live, std::path::Path::new(&record.exe)) {
+            return;
+        }
+
+        self.push_log(
+            "shell",
+            format!(
+                "检测到上一轮残留的后端进程 (pid {}),正在回收...",
+                record.pid
+            ),
+        );
+        kill_tree(record.pid, true);
     }
 
     // ---- 只读访问 ----
@@ -359,6 +452,11 @@ impl Runner {
         self.sink
             .push_log("shell", format!("$ {}", command_line));
 
+        // 关键兜底:把子进程纳入作业对象,壳一旦消失由内核连带回收整棵树。
+        let job_note = self.enroll_in_job(pid);
+        self.sink.push_log("shell", job_note);
+        self.write_pid_record(pid, &py.executable);
+
         // 日志回流
         if let Some(out) = stdout {
             spawn_reader(self.sink.clone(), "stdout", out);
@@ -415,6 +513,7 @@ impl Runner {
         let sup = self.sup.lock().take();
         let Some(mut sup) = sup else {
             *self.sink.state.write() = State::Stopped;
+            self.clear_pid_record();
             return Ok(());
         };
 
@@ -426,6 +525,7 @@ impl Runner {
             kill_tree(pid, true);
         }
         *self.sink.pid.write() = None;
+        self.clear_pid_record();
 
         self.sink
             .set(Stage::Idle, State::Stopped, "后端已停止".to_string());
@@ -467,6 +567,19 @@ fn spawn_reader<R: AsyncRead + Unpin + Send + 'static>(
             }
         }
     });
+}
+
+/// 上一轮拉起的后端进程记录。仅用于启动时回收残留。
+#[derive(Debug, Serialize, Deserialize)]
+struct PidRecord {
+    pid: u32,
+    /// 解释器完整路径。回收前会与存活进程的映像路径比对,防止 PID 复用误杀。
+    exe: String,
+}
+
+/// pid 记录文件位置(与 `DEEPTUTOR_HOME` 同目录)。
+fn pid_record_path() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|dir| dir.join("DeepTutor").join("backend.pid"))
 }
 
 /// 杀掉进程树。
