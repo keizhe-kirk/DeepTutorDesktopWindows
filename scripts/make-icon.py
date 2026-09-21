@@ -134,9 +134,19 @@ def make_background(size: int, radius: int) -> Image.Image:
     return grad
 
 
-def fit_into_square(img: Image.Image, size: int, pad_ratio: float) -> Image.Image:
-    """按图案实际边界裁剪，等比缩放到 (size - 2*pad) 的方框内并居中。"""
-    bbox = img.split()[3].getbbox()
+def fit_into_square(img: Image.Image, size: int, pad_ratio: float,
+                    bbox_threshold: int = 32) -> Image.Image:
+    """按图案实际边界裁剪，等比缩放到 (size - 2*pad) 的方框内并居中。
+
+    ⚠️ bbox 用阈值过滤后再取，不能直接用原始 alpha ——
+    去白底后往往残留极淡的抗锯齿「星点」(alpha 个位数)，
+    会把 bbox 撑大，导致图案被缩小并偏离中心。
+    """
+    if bbox_threshold > 0:
+        mask = img.split()[3].point(lambda v: 255 if v >= bbox_threshold else 0)
+    else:
+        mask = img.split()[3]
+    bbox = mask.getbbox()
     if bbox is None:
         raise SystemExit("图案全透明，去白底可能失败了")
     cropped = img.crop(bbox)
