@@ -24,7 +24,10 @@ param(
     # Node.js 版本(官方 LTS)
     [string]$NodeVersion   = "v22.23.2",
     # 内置的 deeptutor 版本
-    [string]$DeepTutorSpec = "deeptutor==1.6.8",
+    # ⚠️ 改这一行是让新装用户拿到新后端的唯一途径 —— CI 的运行时缓存 key 含
+    #    hashFiles('scripts/fetch-runtimes.ps1'),只有本文件内容变了缓存才会失效。
+    #    光打 tag 不改这里,CI 会复用旧缓存,内置版本原样不变。
+    [string]$DeepTutorSpec = "deeptutor==1.6.9",
     # pip 索引源,留空则用官方 PyPI
     [string]$IndexUrl      = "",
     # 强制重新下载/重装
