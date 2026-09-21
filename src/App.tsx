@@ -51,6 +51,17 @@ interface UpdateCheck {
   date: string | null
 }
 
+/** 与 Rust 侧 updater::Phase 对应。 */
+type UpdatePhase = 'downloading' | 'installing'
+
+/** 与 Rust 侧 updater::Progress 对应,由 `update://progress` 事件推来。 */
+interface UpdateProgress {
+  phase: UpdatePhase
+  downloaded: number
+  total: number | null
+  percent: number | null
+}
+
 const STAGE_ORDER: Stage[] = ['locating_python', 'checking_deps', 'starting', 'probing', 'ready']
 
 const STAGE_LABEL: Record<Stage, string> = {
@@ -80,6 +91,7 @@ export default function App() {
   const [lmStudio, setLmStudio] = useState<LmStudioInfo>({ detected: false, base_url: null, models: [] })
   const [update, setUpdate] = useState<UpdateCheck | null>(null)
   const [updating, setUpdating] = useState(false)
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgress | null>(null)
   const consoleRef = useRef<HTMLDivElement>(null)
 
   const refreshLmStudio = async () => {
@@ -101,11 +113,15 @@ export default function App() {
     const unLog = listen<LogLine>('backend://log', e =>
       setLogs(prev => [...prev, e.payload].slice(-300)),
     )
+    // 下载/安装进度。注意:更新也可能从托盘菜单发起,那时本页早已被
+    // DeepTutor Web UI 顶掉、收不到事件 —— 托盘侧会用 tooltip 兜底显示。
+    const unProgress = listen<UpdateProgress>('update://progress', e => setUpdateProgress(e.payload))
 
     const timer = setInterval(() => setElapsed(v => v + 1), 1000)
     return () => {
       unState.then(f => f())
       unLog.then(f => f())
+      unProgress.then(f => f())
       clearInterval(timer)
     }
   }, [])
@@ -169,11 +185,14 @@ export default function App() {
 
   const doUpdate = async () => {
     setUpdating(true)
+    setUpdateProgress(null)
     try {
+      // Windows 上安装器拉起后本进程会退出,这个 await 通常不会返回。
       await invoke('install_update')
     } catch (e) {
       setLogs(prev => [...prev, { ts: '--:--:--', stream: 'shell', line: `更新失败: ${e}` }])
       setUpdating(false)
+      setUpdateProgress(null)
     }
   }
 
@@ -297,12 +316,36 @@ export default function App() {
         )}
 
         <div className="updater">
-          {!update && (
+          {!update && !updating && (
             <button className="ghost mini" onClick={checkUpdate}>
               检查更新
             </button>
           )}
-          {update && !update.available && (
+          {updating && (
+            <div className="updater-row">
+              <div className="updater-info">
+                <span className="updater-new">
+                  {updateProgress?.phase === 'installing'
+                    ? '正在安装更新,程序即将重启…'
+                    : '正在下载更新…'}
+                </span>
+                <div className="updater-track">
+                  <div
+                    className={`updater-fill${updateProgress?.percent == null ? ' indeterminate' : ''}`}
+                    style={{ width: `${updateProgress?.percent ?? 0}%` }}
+                  />
+                </div>
+              </div>
+              <span className="updater-pct">
+                {updateProgress?.percent != null
+                  ? `${updateProgress.percent.toFixed(0)}%`
+                  : updateProgress?.total == null && updateProgress
+                    ? '准备中'
+                    : ''}
+              </span>
+            </div>
+          )}
+          {!updating && update && !update.available && (
             <div className="updater-row">
               <span className="updater-ok">已是最新版本 (v{update.current_version})</span>
               <button className="ghost mini" onClick={checkUpdate}>
@@ -310,7 +353,7 @@ export default function App() {
               </button>
             </div>
           )}
-          {update && update.available && (
+          {!updating && update && update.available && (
             <div className="updater-row">
               <div className="updater-info">
                 <span className="updater-new">
@@ -318,8 +361,8 @@ export default function App() {
                 </span>
                 {update.body && <span className="updater-body">{update.body}</span>}
               </div>
-              <button className="mini" onClick={doUpdate} disabled={updating}>
-                {updating ? '下载中...' : '立即更新'}
+              <button className="mini" onClick={doUpdate}>
+                立即更新
               </button>
             </div>
           )}

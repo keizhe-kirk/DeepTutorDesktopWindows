@@ -262,3 +262,39 @@ button.mini {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* 下载进度条。总长度未知(percent 为 null)时走 indeterminate 动画,
+   避免出现一根永远停在 0% 的条让人以为卡死了。 */
+.updater-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--line);
+  overflow: hidden;
+  margin-top: 3px;
+}
+
+.updater-fill {
+  height: 100%;
+  border-radius: 2px;
+  background: var(--teal);
+  transition: width 0.2s ease;
+}
+
+.updater-fill.indeterminate {
+  width: 40%;
+  transition: none;
+  animation: updater-slide 1.2s ease-in-out infinite;
+}
+
+@keyframes updater-slide {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(350%); }
+}
+
+.updater-pct {
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  min-width: 34px;
+  text-align: right;
+}

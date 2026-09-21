@@ -1,6 +1,6 @@
 [package]
 name = "DeepTutorDesktopWin"
-version = "0.2.1"
+version = "0.2.2"
 description = "Native Windows shell for HKUDS/DeepTutor"
 authors = ["DeepTutor Contributors"]
 edition = "2021"
@@ -21,6 +21,9 @@ tauri-plugin-single-instance = "2.4"
 tauri-plugin-autostart = "2.5"
 tauri-plugin-updater = "2.11"
 tauri-plugin-window-state = "2.4"
+# 原生对话框:托盘菜单触发的更新流程需要它做「发现新版本,是否安装」的确认。
+# 前端 IPC 侧不调用 dialog,所以 capabilities 里不需要额外授权。
+tauri-plugin-dialog = "2"
 tauri-plugin-log = "2.9"
 tauri-plugin-shell = "2.3"
 tauri-plugin-os = "2.3"

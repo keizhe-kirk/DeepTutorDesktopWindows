@@ -11,21 +11,29 @@
 //!                    使正式安装包不依赖用户机器上的运行时
 //! - lmstudio/*     : LM Studio 桥接(模型列表/加载/卸载)
 //! - ima/*          : 腾讯 IMA 自定义协议与桥接
-//! - tray.rs        : 系统托盘菜单
+//! - tray.rs        : 系统托盘菜单(含「检查更新…」入口)
+//! - updater.rs     : 自动更新(检查/下载/安装),托盘与前端共用
 //! - autostart.rs   : HKCU\...\Run 自启动注册
 
 pub mod backend;
 pub mod lmstudio;
 pub mod ima;
 pub mod tray;
+pub mod updater;
 pub mod autostart;
 
-use std::sync::Arc;
+use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
 
 use tauri::Manager;
 
 use backend::runner::Runner;
 use backend::BundledRuntimes;
+
+/// 是否已经提示过「已最小化到托盘」。
+///
+/// 只在本次运行内提示一次:反复弹框会烦人,但第一次关窗如果不说明,
+/// 用户会以为程序没关掉(其实在托盘里活着,后端也还在跑)。
+static TRAY_HINT_SHOWN: AtomicBool = AtomicBool::new(false);
 
 /// 启动器:构建并运行 Tauri 应用。
 pub fn run() {
@@ -34,18 +42,33 @@ pub fn run() {
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(win) = app.get_webview_window("main") {
                 let _ = win.unminimize();
+                let _ = win.show();
                 let _ = win.set_focus();
             }
         }))
-        // 窗口位置/尺寸记忆
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        // 窗口位置/尺寸记忆。
+        //
+        // 显式排除 VISIBLE:本应用「关窗 = 隐藏到托盘」,若把可见性也记下来,
+        // 用户在隐藏状态下退出(托盘右键退出)后,下次启动窗口会是隐藏的 ——
+        // 表现为「双击图标没反应」,极难排查。
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::all()
+                        & !tauri_plugin_window_state::StateFlags::VISIBLE,
+                )
+                .build(),
+        )
         // 自启动
         .plugin(tauri_plugin_autostart::init(
             tauri_plugin_autostart::MacosLauncher::LaunchAgent,
             Some(vec!["--autostart"]),
         ))
-        // 自动更新(github releases)
+        // 自动更新(github releases);托盘菜单的更新流程也走它
         .plugin(tauri_plugin_updater::Builder::new().build())
+        // 原生对话框:更新流程的确认/结果提示。
+        // 只在 Rust 侧使用(托盘菜单),前端不经 IPC 调用,故无需 capabilities 授权。
+        .plugin(tauri_plugin_dialog::init())
         // 日志
         .plugin(tauri_plugin_log::Builder::default().build())
         // shell(打开外部链接用)
@@ -77,24 +100,37 @@ pub fn run() {
             backend::boot::spawn(app.handle());
             Ok(())
         })
-        // 关闭主窗口 = 退出应用。
+        // 关闭主窗口 = 隐藏到系统托盘(不退出)。
         //
-        // 之前"关窗口 ≠ 关后端":窗口关了,`python -m deeptutor start` 那条进程链
-        // 仍在后台跑,死占 8001 / 3782,下次启动会静默连到旧服务上。
-        // 这里在关闭请求上显式清理,再退出;托盘的"打开/隐藏主窗口"仍用于隐藏窗口,
-        // 所以隐藏 ≠ 关闭,两者语义不再混淆。
+        // 这样后端继续跑,托盘随时能唤回来 —— 也避免了「用户以为关了,
+        // 其实 python 进程还占着 8001/3782」这类困惑。
+        //
+        // 真正退出走托盘菜单的「退出」,那里会显式清理后端进程树。
+        //
+        // 注意与历史行为的差异:0.2.1 及更早「关窗即退出」,是为了解决
+        // 「窗口关了后端还在跑」的问题。现在改成关窗隐藏,那个问题由
+        // 托盘退出路径 + Job Object 兜底解决,不再需要关窗就杀进程。
         .on_window_event(|window, event| {
-            if let tauri::WindowEvent::CloseRequested { .. } = event {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 if window.label() != "main" {
                     return;
                 }
-                let app = window.app_handle();
-                // 同步杀进程树 —— 此时 async runtime 可能已不再被驱动
-                if let Some(runner) = app.try_state::<Arc<Runner>>() {
-                    runner.kill_tree_sync();
+                api.prevent_close();
+                let _ = window.hide();
+                log::info!("主窗口已隐藏到系统托盘(应用与后端继续运行)");
+
+                // 首次关窗提示一次,否则用户会以为程序没关掉。
+                if !TRAY_HINT_SHOWN.swap(true, Ordering::SeqCst) {
+                    use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+                    let app = window.app_handle().clone();
+                    tauri::async_runtime::spawn(async move {
+                        app.dialog()
+                            .message("DeepTutor 仍在后台运行,可从系统托盘图标唤回。\n\n要彻底退出请右键托盘图标选择「退出」。")
+                            .title("已最小化到托盘")
+                            .kind(MessageDialogKind::Info)
+                            .blocking_show();
+                    });
                 }
-                log::info!("主窗口关闭,后端进程树已清理,应用退出");
-                app.exit(0);
             }
         })
         .invoke_handler(tauri::generate_handler![
@@ -129,7 +165,6 @@ mod commands {
 
     use serde::Serialize;
     use tauri::{AppHandle, Manager};
-    use tauri_plugin_updater::UpdaterExt;
 
     use crate::backend::boot;
     use crate::backend::runner::{LogLine, Runner, StatusSnapshot};
@@ -246,58 +281,21 @@ mod commands {
             .map_err(|e| e.to_string())
     }
 
-    /// 检查更新结果。
-    #[derive(Serialize)]
-    pub struct UpdateCheck {
-        pub available: bool,
-        pub current_version: String,
-        pub latest_version: Option<String>,
-        pub body: Option<String>,
-        pub date: Option<String>,
-    }
+    /// 检查更新结果(定义在 updater 模块,前端类型与之对应)。
+    pub use crate::updater::UpdateCheck;
 
-    /// 检查是否有新版本(github releases latest.json)。
+    /// 检查是否有新版本。实际实现在 `updater::check`,与托盘菜单共用。
     #[tauri::command]
     pub async fn check_for_update(app: AppHandle) -> Result<UpdateCheck, String> {
-        let current = app
-            .package_info()
-            .version
-            .to_string();
-        let updater = app
-            .updater()
-            .map_err(|e| format!("初始化更新器失败: {e}"))?;
-        match updater.check().await.map_err(|e| e.to_string())? {
-            Some(update) => Ok(UpdateCheck {
-                available: true,
-                current_version: current,
-                latest_version: Some(update.version),
-                body: update.body,
-                date: update.date.map(|d| d.to_string()),
-            }),
-            None => Ok(UpdateCheck {
-                available: false,
-                current_version: current,
-                latest_version: None,
-                body: None,
-                date: None,
-            }),
-        }
+        crate::updater::check(&app).await
     }
 
-    /// 下载并安装更新(Windows 下安装完成后会自动退出并拉起新版本)。
+    /// 下载并安装更新。
+    ///
+    /// Windows 下安装器拉起后本进程会退出并由安装程序接管,故正常路径不会返回。
+    /// 实现见 `updater::install` —— 那里在启动安装器前会先停掉后端进程树。
     #[tauri::command]
     pub async fn install_update(app: AppHandle) -> Result<(), String> {
-        let updater = app
-            .updater()
-            .map_err(|e| format!("初始化更新器失败: {e}"))?;
-        let update = updater
-            .check()
-            .await
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| "当前已是最新版本".to_string())?;
-        update
-            .download_and_install(|_chunk, _total| {}, || {})
-            .await
-            .map_err(|e| e.to_string())
+        crate::updater::install(&app).await
     }
 }
