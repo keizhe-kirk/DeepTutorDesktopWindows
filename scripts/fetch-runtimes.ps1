@@ -13,7 +13,7 @@
 # Usage:
 #   pwsh -ExecutionPolicy Bypass -File scripts\fetch-runtimes.ps1
 #   pwsh ... -IndexUrl https://pypi.tuna.tsinghua.edu.cn/simple    # 国内加速
-#   pwsh ... -DeepTutorSpec "deeptutor==1.6.9"                     # 升级内置版本
+#   pwsh ... -DeepTutorSpec "deeptutor==1.6.12"                    # 升级内置版本
 #   pwsh ... -Force -SkipNode                                      # 只重建 Python 侧
 
 [CmdletBinding()]
@@ -27,7 +27,7 @@ param(
     # ⚠️ 改这一行是让新装用户拿到新后端的唯一途径 —— CI 的运行时缓存 key 含
     #    hashFiles('scripts/fetch-runtimes.ps1'),只有本文件内容变了缓存才会失效。
     #    光打 tag 不改这里,CI 会复用旧缓存,内置版本原样不变。
-    [string]$DeepTutorSpec = "deeptutor==1.6.9",
+    [string]$DeepTutorSpec = "deeptutor==1.6.12",
     # pip 索引源,留空则用官方 PyPI
     [string]$IndexUrl      = "",
     # 强制重新下载/重装
