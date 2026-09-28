@@ -298,3 +298,209 @@ button.mini {
   min-width: 34px;
   text-align: right;
 }
+
+/* 后端热更新区块:沿用桌面壳更新的整套版式,只用虚线分隔做区分 ——
+   两者是独立链路(一个换壳、一个换后端),不该看起来像同一个操作。 */
+.backend-updater {
+  margin-top: 10px;
+  border-top: 1px dashed var(--line);
+}
+
+/* 「热更新」小标签:后端版本来自用户目录的叠加层,而非安装包内置。 */
+.backend-badge {
+  margin-left: 6px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: rgba(45, 156, 148, 0.12);
+  color: var(--teal);
+  font-size: 10px;
+  font-weight: 500;
+  vertical-align: middle;
+}
+
+/* 一行里并排的小按钮组 */
+.row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ===== 开机动画 =====
+   动效的关键不是"调曲线",而是让值**画过头再退回来**(折返)。
+   单段 transition 无论怎么调 cubic-bezier 都是单调走到终点,看着永远是平顺过渡。
+   三条曲线的方向手感不同,所以必须各用一条:
+     冲出  猛起步 + 强减速      cubic-bezier(.12,.86,.26,1)  240ms
+     落定  常规                 cubic-bezier(.34,0,.28,1)    200ms
+     收回  起步慢 + 越走越快    cubic-bezier(.52,.04,.72,.24) 320ms
+   ⚠️ 这两个时长在 BootStage.tsx 里也有同名常量(JS 的 setTimeout 写不了变量),
+      改的时候两边一起改。 */
+:root {
+  --burst-ms: 240ms;
+  --settle-ms: 200ms;
+  --ease-burst: cubic-bezier(0.12, 0.86, 0.26, 1);
+  --ease-settle: cubic-bezier(0.34, 0, 0.28, 1);
+  --ease-close: cubic-bezier(0.52, 0.04, 0.72, 0.24);
+}
+
+.boot-wrap {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+
+.boot {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 40px 24px;
+  text-align: center;
+}
+
+.boot-mark {
+  position: relative;
+  width: 210px;
+  height: 210px;
+  display: grid;
+  place-items: center;
+}
+
+.boot-lines {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.boot-lines path {
+  fill: none;
+  stroke: url(#bootStroke);
+  stroke-width: 11;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  opacity: 0.9;
+  /* 基线(阶段内爬升)用**短 + 线性**:
+     爬升目标本身就是平顺的,过渡只是用来抹平 120ms 一次的更新台阶。
+     ⚠️ 不能用长的 ease-in-out —— 它起步斜率为 0,而进度是高频写入的,
+     每次写入都把过渡从头重启,值几乎不挪(过渡饿死)。线性起步不为 0,能收敛。
+     ⚠️ 也别加 transition-delay(错峰起笔):延迟期内就会被下一次写入重启。 */
+  transition: stroke-dashoffset 140ms linear;
+}
+
+/* 冲出:一次性写入 + 240ms 不被打扰,才用得起"猛起步"的曲线 */
+.boot-lines path.goup {
+  transition: stroke-dashoffset var(--burst-ms) var(--ease-burst);
+}
+
+/* 收回:同样是一次性写入,用落定曲线把过冲拽回来 */
+.boot-lines path.goback {
+  transition: stroke-dashoffset var(--settle-ms) var(--ease-settle);
+}
+
+/* 正在画的那一条:亮一点 + 一点光,让"笔走到哪儿"看得出来 */
+.boot-lines path.drawing {
+  stroke-width: 13;
+  opacity: 1;
+  filter: drop-shadow(0 0 6px rgba(29, 158, 117, 0.35));
+}
+
+/* 画完之后:线稿交棒给真正的品牌 mark。
+   这里是"先出后入"的交接,不是 morph —— 线稿是轮廓,和成品 logo 对不齐,
+   硬做形变会很难看。 */
+.boot-real {
+  position: absolute;
+  width: 116px;
+  height: 116px;
+  border-radius: 26px;
+  background-image: url('/logo.png');
+  background-size: cover;
+  background-position: center;
+  box-shadow: 0 10px 30px rgba(29, 158, 117, 0.28);
+  opacity: 0;
+  transform: scale(0.9);
+  transition: opacity 320ms var(--ease-settle), transform 320ms var(--ease-burst);
+  pointer-events: none;
+}
+
+.boot--ready .boot-lines {
+  opacity: 0;
+  transform: scale(1.06);
+  transition: opacity 260ms var(--ease-close), transform 320ms var(--ease-settle);
+}
+
+.boot--ready .boot-real {
+  opacity: 1;
+  transform: scale(1);
+}
+
+.boot-label {
+  display: flex;
+  align-items: baseline;
+  gap: 2px;
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  color: var(--ink);
+}
+
+.boot-dots {
+  display: inline-block;
+  width: 14px;
+}
+
+.boot-dots::after {
+  content: '·';
+  animation: blink 1.2s infinite;
+}
+
+.boot-status {
+  font-size: 13px;
+  color: var(--ink);
+  min-height: 20px;
+}
+
+.boot-hint {
+  font-size: 12px;
+  color: var(--muted);
+  max-width: 420px;
+  white-space: pre-wrap;
+}
+
+.boot--failed .boot-status {
+  color: #b42318;
+  font-weight: 600;
+}
+
+.boot--failed .boot-lines path {
+  stroke: #d64545;
+}
+
+.boot-version {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 失败时才展开诊断面板:成功启动的用户根本不该看到这些 */
+.boot-diag-toggle {
+  margin-top: 4px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  /* 兜底:BootStage 在减弱动态下本来就不做冲出/收回(见 REDUCED),
+     这里再把过渡压到 1ms,保证任何路径下都不会有大动作。 */
+  .boot-lines path,
+  .boot-lines path.goup,
+  .boot-lines path.goback,
+  .boot-real,
+  .boot--ready .boot-lines {
+    transition-duration: 1ms !important;
+  }
+  .boot-dots::after {
+    animation: none;
+  }
+}

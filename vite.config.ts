@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import pkg from './package.json'
 
 // Tauri 暴露的 dev URL:
 // - 前端壳 UI 启动后由 Tauri 接管 webview
@@ -21,6 +22,9 @@ export default defineConfig(async () => ({
     'import.meta.env.VITE_DEEPTUTOR_WEB_PORT': JSON.stringify(
       process.env.DEEPTUTOR_WEB_PORT ?? '3782',
     ),
+    // 版本号直接吃 package.json —— 免得启动页显示的版本要靠手抄兜底值,
+    // 发版时漏改就显示成上一版(那是第五处版本号,最容易漏)。
+    'import.meta.env.VITE_SHELL_VERSION': JSON.stringify(pkg.version),
   },
   build: {
     target: 'es2022',
