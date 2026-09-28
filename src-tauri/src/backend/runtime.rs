@@ -108,6 +108,43 @@ impl BundledRuntimes {
         candidate.is_file().then_some(candidate)
     }
 
+    /// 内置解释器的 `site-packages` 目录。
+    ///
+    /// Windows 是固定布局 `python\Lib\site-packages`;其他平台要带
+    /// `pythonX.Y` 段,所以按 `python3*` 扫一遍取最后一个命中。
+    /// `bootstrap-python.ps1` 组装出来的目录也是这个布局。
+    pub fn site_packages_dir(&self) -> Option<PathBuf> {
+        let python_root = self.root()?.join("python");
+
+        #[cfg(windows)]
+        {
+            let candidate = python_root.join("Lib").join("site-packages");
+            candidate.is_dir().then_some(candidate)
+        }
+
+        #[cfg(not(windows))]
+        {
+            let lib = python_root.join("lib");
+            let mut best: Option<PathBuf> = None;
+            for entry in std::fs::read_dir(&lib).ok()?.flatten() {
+                let name = entry.file_name();
+                if !name.to_string_lossy().starts_with("python3") {
+                    continue;
+                }
+                let candidate = entry.path().join("site-packages");
+                if candidate.is_dir() {
+                    best = Some(candidate);
+                }
+            }
+            best
+        }
+    }
+
+    /// 内置 deeptutor 的版本号。读不到返回 `None`。
+    pub fn deeptutor_version(&self) -> Option<String> {
+        read_deeptutor_version(&self.site_packages_dir()?)
+    }
+
     /// 是否 Python 与 Node 都齐备(齐备才算真正自包含)。
     pub fn is_complete(&self) -> bool {
         self.python_exe().is_some() && self.node_exe().is_some()
@@ -156,4 +193,48 @@ pub fn runtime_home_override() -> Option<PathBuf> {
         return None;
     }
     dirs::data_local_dir().map(|dir| dir.join("DeepTutor"))
+}
+
+/// deeptutor 运行数据根目录的**实际取值**。
+///
+/// [`runtime_home_override`] 表达的是"要不要覆盖",这里给的是"最终是哪个目录"
+/// —— 用户设了 `DEEPTUTOR_HOME` 就用它,没设就用 `%LOCALAPPDATA%\DeepTutor`。
+///
+/// 热更新的叠加层挂在它下面(`<home>\backend`),所以必须和子进程实际用的
+/// home 完全一致:用户把 home 挪到 D 盘时,叠加层也得跟着挪,否则会出现
+/// "升级成功了但界面上版本号没变"这种极难排查的现象。
+pub fn effective_home() -> PathBuf {
+    if let Ok(raw) = std::env::var(ENV_DEEPTUTOR_HOME) {
+        let trimmed = raw.trim().trim_matches('"');
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+    }
+    dirs::data_local_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("DeepTutor")
+}
+
+/// 从一个 `site-packages` 目录里读出 deeptutor 的版本号。
+///
+/// 直接解析 `deeptutor/__version__.py` 里的 `__version__ = "x.y.z"`。
+/// 选这个源是因为**界面侧边栏读的就是同一个文件**(见 deeptutor 的
+/// `__version__.py` 顶部注释),不存在两处版本不一致的可能。
+pub fn read_deeptutor_version(site_packages: &Path) -> Option<String> {
+    let version_py = site_packages.join("deeptutor").join("__version__.py");
+    let text = std::fs::read_to_string(version_py).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("__version__") else {
+            continue;
+        };
+        let Some((_, rhs)) = rest.split_once('=') else {
+            continue;
+        };
+        let value = rhs.trim().trim_matches(['"', '\'']);
+        if !value.is_empty() {
+            return Some(value.to_string());
+        }
+    }
+    None
 }

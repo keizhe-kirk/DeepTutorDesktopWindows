@@ -347,7 +347,16 @@ impl Runner {
                 cmd.arg(script);
             }
             None => {
-                cmd.arg("-m").arg(&cfg.module);
+                // `-P`(Python 3.11+):不要把 cwd 塞进 `sys.path[0]`。
+                //
+                // 后端热更新的叠加层靠 PYTHONPATH 生效,而 sys.path 里 **cwd
+                // 排在 PYTHONPATH 之前**(实测确认)。当前 cwd 是数据目录
+                // `%LOCALAPPDATA%\DeepTutor`,正常不会有 `deeptutor/` 子目录 ——
+                // 但万一有(用户往那儿放过东西),叠加层就会静默失效,表现为
+                // "升级成功了但版本号没变"这种极难排查的现象。
+                // `-P` 从根上消掉这一整类风险,且 deeptutor 不依赖 cwd 在
+                // sys.path 里,没有副作用。
+                cmd.arg("-P").arg("-m").arg(&cfg.module);
             }
         }
         for arg in &cfg.args {
@@ -383,6 +392,35 @@ impl Runner {
                 Err(e) => self.sink.push_log(
                     "shell",
                     format!("警告:合并 PATH 失败,内置 Node 可能不生效: {}", e),
+                ),
+            }
+        }
+
+        // 后端热更新的叠加层:把用户目录里的新版 deeptutor 前置到 PYTHONPATH。
+        //
+        // Python 的 sys.path 顺序是「脚本目录 -> PYTHONPATH -> 标准库 ->
+        // site-packages」,PYTHONPATH 排在 site-packages **之前** —— 于是叠加层
+        // 里的新版自动盖住安装目录里的内置版,而安装目录一个字节都不用改
+        // (它是 perMachine 装的,普通用户根本写不进去)。
+        //
+        // 必须 merge 而不是覆盖:用户环境里若已有 PYTHONPATH,直接 env() 会把
+        // 它顶掉,用户自己的包会集体消失。
+        if let Some(overlay_dir) = overlay_python_path(&bundled) {
+            let mut entries = vec![overlay_dir.clone()];
+            if let Some(existing) = std::env::var_os("PYTHONPATH") {
+                entries.extend(std::env::split_paths(&existing));
+            }
+            match std::env::join_paths(entries) {
+                Ok(joined) => {
+                    cmd.env("PYTHONPATH", &joined);
+                    self.sink.push_log(
+                        "shell",
+                        format!("已启用后端叠加层: {}", overlay_dir.display()),
+                    );
+                }
+                Err(e) => self.sink.push_log(
+                    "shell",
+                    format!("警告:合并 PYTHONPATH 失败,叠加层可能不生效: {}", e),
                 ),
             }
         }
@@ -619,4 +657,14 @@ fn kill_tree(pid: u32, force: bool) {
                 .output();
         }
     }
+}
+
+/// 后端叠加层生效时,要前置进子进程 `PYTHONPATH` 的目录。
+///
+/// 判定逻辑全在 [`super::overlay::Overlay::effective_dir`] 里,包含
+/// 「内置版反超叠加层时自动作废」这条规则 —— 桌面壳升级后,内置版可能比
+/// 用户此前热更新的版本还新,这时必须用内置的,否则会莫名其妙降级。
+fn overlay_python_path(bundled: &BundledRuntimes) -> Option<PathBuf> {
+    let overlay = super::overlay::Overlay::detect(Some(runtime::effective_home()));
+    overlay.effective_dir(bundled.deeptutor_version().as_deref())
 }

@@ -98,6 +98,8 @@ pub fn run() {
             ima::protocol::register(app.handle())?;
             // 启动后端引导流程(异步,不阻塞窗口显示)
             backend::boot::spawn(app.handle());
+            // 后端就绪后静默查一次有没有新版后端(只提示,不自动装)
+            backend::hotupdate::spawn_auto_check(app.handle());
             Ok(())
         })
         // 关闭主窗口 = 隐藏到系统托盘(不退出)。
@@ -145,6 +147,10 @@ pub fn run() {
             commands::lmstudio_unload,
             commands::check_for_update,
             commands::install_update,
+            commands::backend_versions,
+            commands::check_backend_update,
+            commands::install_backend_update,
+            commands::rollback_backend,
         ])
         .build(tauri::generate_context!())
         .expect("error while building DeepTutor shell");
@@ -167,6 +173,7 @@ mod commands {
     use tauri::{AppHandle, Manager};
 
     use crate::backend::boot;
+    use crate::backend::hotupdate;
     use crate::backend::runner::{LogLine, Runner, StatusSnapshot};
     use crate::lmstudio::{Detector, ModelInfo, ModelsClient};
 
@@ -297,5 +304,37 @@ mod commands {
     #[tauri::command]
     pub async fn install_update(app: AppHandle) -> Result<(), String> {
         crate::updater::install(&app).await
+    }
+
+    // ---- 后端(deeptutor)热更新 ----
+    //
+    // 与上面两个命令的区别:那两个更新的是**桌面壳**(GitHub Releases),
+    // 下面这几个更新的是**后端**(PyPI),只重启 Python 子进程。
+    // 详见 `crate::backend::hotupdate` 的模块文档。
+
+    /// 当前后端版本分布(叠加层优先于安装包内置版)。
+    #[tauri::command]
+    pub fn backend_versions(app: AppHandle) -> hotupdate::Versions {
+        let runner: Arc<Runner> = app.state::<Arc<Runner>>().inner().clone();
+        hotupdate::versions(&runner)
+    }
+
+    /// 检查 PyPI 上有没有新的后端版本。
+    #[tauri::command]
+    pub async fn check_backend_update(app: AppHandle) -> Result<hotupdate::UpdateInfo, String> {
+        let runner: Arc<Runner> = app.state::<Arc<Runner>>().inner().clone();
+        hotupdate::check(&runner).await
+    }
+
+    /// 下载并安装新版后端(含依赖解析)。后端会在完成后自动重启。
+    #[tauri::command]
+    pub async fn install_backend_update(app: AppHandle) -> Result<hotupdate::InstallReport, String> {
+        hotupdate::install(&app).await
+    }
+
+    /// 回退到安装包内置的后端版本。
+    #[tauri::command]
+    pub async fn rollback_backend(app: AppHandle) -> Result<String, String> {
+        hotupdate::rollback(&app).await
     }
 }
