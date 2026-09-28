@@ -1,6 +1,6 @@
 [package]
 name = "DeepTutorDesktopWin"
-version = "0.2.5"
+version = "0.2.6"
 description = "Native Windows shell for HKUDS/DeepTutor"
 authors = ["DeepTutor Contributors"]
 edition = "2021"
@@ -38,6 +38,19 @@ chrono = { version = "0.4", features = ["serde"] }
 dirs = "6"
 parking_lot = "0.12"
 which = "6"
+
+# ---- 后端热更新(backend_updater)专用 ----
+# PEP 508 依赖声明解析:wheel 的 METADATA 里 `Requires-Dist: foo>=1.2 ; python_version < "3.14"`
+# 这种串要拆成 名称 / 版本约束 / 环境标记 三部分,还要对标记求值。
+# 自己写正则能覆盖八成,但 marker 求值和 extras 语义边角太多 —— 交给 astral(uv 作者)的
+# pep508_rs 更稳,它内部已经把 pep440 的版本比较一起带上了。
+pep508_rs = "0.9"
+pep440_rs = "0.7"
+# wheel 本质就是个 zip 包(顶层直接是包目录,无 root 前缀)。
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# 下载 wheel 后按 PyPI 给的 sha256 校验,防中间人 / 断流截断。
+sha2 = "0.10"
+hex = "0.4"
 
 # Windows 作业对象(Job Object):保证壳进程消失时后端子进程树被内核一并回收。
 # 见 backend/winproc.rs 的模块文档。
