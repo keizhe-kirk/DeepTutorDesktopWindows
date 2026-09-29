@@ -23,6 +23,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::oneshot;
 
+use super::ca;
 use super::config::BackendConfig;
 use super::health::Health;
 use super::python::PythonLocator;
@@ -422,6 +423,26 @@ impl Runner {
                     "shell",
                     format!("警告:合并 PYTHONPATH 失败,叠加层可能不生效: {}", e),
                 ),
+            }
+        }
+
+        // CA 信任合并:把 Windows 证书库里 certifi 缺的根(加速器/企业代理的 MITM 根)
+        // 补进信任库,否则后端 Python 的 HTTPS 会 CERTIFICATE_VERIFY_FAILED
+        // (实测:SteamTools 的 GitHub 加速就是这样把「检查更新」打挂的)。
+        // 只注入子进程,不动用户环境变量;生成失败就退回默认信任,不会更糟。
+        match ca::build_merged_bundle(&py.executable, &runtime::effective_home()) {
+            Some(bundle) => {
+                cmd.env("SSL_CERT_FILE", &bundle)
+                    .env("REQUESTS_CA_BUNDLE", &bundle)
+                    .env("CURL_CA_BUNDLE", &bundle);
+                self.sink.push_log(
+                    "shell",
+                    format!("已注入合并 CA 信任库(含 Windows 证书库补充根): {}", bundle.display()),
+                );
+            }
+            None => {
+                self.sink
+                    .push_log("shell", "CA 信任库:沿用 certifi 默认(无需补充根)");
             }
         }
 
