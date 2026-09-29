@@ -1,6 +1,6 @@
 [package]
 name = "DeepTutorDesktopWin"
-version = "0.2.6"
+version = "0.2.7"
 description = "Native Windows shell for HKUDS/DeepTutor"
 authors = ["DeepTutor Contributors"]
 edition = "2021"
@@ -51,6 +51,8 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 # 下载 wheel 后按 PyPI 给的 sha256 校验,防中间人 / 断流截断。
 sha2 = "0.10"
 hex = "0.4"
+# CA 信任合并:把 Windows 证书库根编码进 PEM(见 backend/ca.rs)。
+base64 = "0.22"
 
 # Windows 作业对象(Job Object):保证壳进程消失时后端子进程树被内核一并回收。
 # 见 backend/winproc.rs 的模块文档。
@@ -58,6 +60,7 @@ hex = "0.4"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Cryptography",
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
