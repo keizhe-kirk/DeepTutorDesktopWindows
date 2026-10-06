@@ -41,7 +41,8 @@
       "icons/icon.ico"
     ],
     "resources": [
-      "runtimes/"
+      "runtimes/",
+      "patches/"
     ],
     "category": "Education",
     "shortDescription": "AI tutoring, on your desktop.",

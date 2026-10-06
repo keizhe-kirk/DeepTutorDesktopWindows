@@ -334,6 +334,23 @@ impl Runner {
 
         let bundled = self.bundled();
 
+        // 本地补丁层:首次(或补丁内容更新时)把安装目录里的补丁播种到用户目录,
+        // 然后才谈"是否注入"。播种是覆盖式的,但**只碰** sitecustomize.py 与
+        // dtpatch_bili/ —— 用户的 B 站登录凭据不在其中,永不被覆盖。
+        //
+        // 种子来自内置运行时的同级目录(与 runtime::detect 的兜底同源),所以这
+        // 一步不依赖 Tauri 的 resource_dir,后端启动阶段就能做。
+        let deeptutor_version = bundled.deeptutor_version();
+        if super::patch::Patches::seed_beside_runtimes(
+            bundled.root(),
+            deeptutor_version.as_deref(),
+        )
+        .is_some()
+        {
+            self.sink
+                .push_log("shell", "本地补丁层:已从安装目录同步最新补丁到用户目录");
+        }
+
         *self.sink.python.write() = Some(format!(
             "{} ({}) [{}]",
             py.executable.display(),
@@ -397,31 +414,43 @@ impl Runner {
             }
         }
 
-        // 后端热更新的叠加层:把用户目录里的新版 deeptutor 前置到 PYTHONPATH。
+        // 后端热更新的叠加层 + 本地补丁层,一起前置进 PYTHONPATH。
         //
         // Python 的 sys.path 顺序是「脚本目录 -> PYTHONPATH -> 标准库 ->
         // site-packages」,PYTHONPATH 排在 site-packages **之前** —— 于是叠加层
         // 里的新版自动盖住安装目录里的内置版,而安装目录一个字节都不用改
         // (它是 perMachine 装的,普通用户根本写不进去)。
         //
+        // 顺序很关键:**叠加层在前、补丁层在后**。补丁要用import 钩子改写
+        // deeptutor.video_learning.service,所以它必须能看见最终生效的那份
+        // deeptutor(即叠加层里的);反过来的话钩子会打在没人用的内置版上。
+        //
         // 必须 merge 而不是覆盖:用户环境里若已有 PYTHONPATH,直接 env() 会把
         // 它顶掉,用户自己的包会集体消失。
-        if let Some(overlay_dir) = overlay_python_path(&bundled) {
-            let mut entries = vec![overlay_dir.clone()];
+        let overlay_dir = overlay_python_path(&bundled);
+        let patch_dir = patch_python_path(&bundled);
+        if overlay_dir.is_some() || patch_dir.is_some() {
+            let mut entries: Vec<PathBuf> = Vec::new();
+            entries.extend(overlay_dir.clone());
+            entries.extend(patch_dir.clone());
             if let Some(existing) = std::env::var_os("PYTHONPATH") {
                 entries.extend(std::env::split_paths(&existing));
             }
             match std::env::join_paths(entries) {
                 Ok(joined) => {
                     cmd.env("PYTHONPATH", &joined);
-                    self.sink.push_log(
-                        "shell",
-                        format!("已启用后端叠加层: {}", overlay_dir.display()),
-                    );
+                    if let Some(dir) = overlay_dir {
+                        self.sink
+                            .push_log("shell", format!("已启用后端叠加层: {}", dir.display()));
+                    }
+                    if let Some(dir) = patch_dir {
+                        self.sink
+                            .push_log("shell", format!("已启用本地补丁层: {}", dir.display()));
+                    }
                 }
                 Err(e) => self.sink.push_log(
                     "shell",
-                    format!("警告:合并 PYTHONPATH 失败,叠加层可能不生效: {}", e),
+                    format!("警告:合并 PYTHONPATH 失败,叠加层/补丁层可能不生效: {}", e),
                 ),
             }
         }
@@ -688,4 +717,17 @@ fn kill_tree(pid: u32, force: bool) {
 fn overlay_python_path(bundled: &BundledRuntimes) -> Option<PathBuf> {
     let overlay = super::overlay::Overlay::detect(Some(runtime::effective_home()));
     overlay.effective_dir(bundled.deeptutor_version().as_deref())
+}
+
+/// 本地补丁层生效时,要前置进子进程 `PYTHONPATH` 的目录。
+///
+/// 判定逻辑在 [`super::patch::Patches::effective_dir`] 里。与叠加层相反,
+/// 这里**不做版本大小比较** —— 补丁的版本号与内置版相同,比较等于自杀;
+/// 改用「补丁记录的基线版本 == 当前内置版」这条等值校验,不等就自动停用。
+///
+/// 另外要求补丁目录里确实有 `sitecustomize.py`:Python 只在能 import 到它时
+/// 才会执行钩子,空目录塞进 `PYTHONPATH` 只会白白污染 `sys.path`。
+fn patch_python_path(bundled: &BundledRuntimes) -> Option<PathBuf> {
+    let patches = super::patch::Patches::detect(Some(runtime::effective_home()));
+    patches.effective_dir(bundled.deeptutor_version().as_deref())
 }

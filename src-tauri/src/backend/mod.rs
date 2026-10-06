@@ -4,6 +4,7 @@
 //! - `runtime`   : 内置运行时(自包含安装包携带的 Python / Node)路径解析
 //! - `overlay`   : 后端热更新的用户级叠加层(新版解到用户目录,靠 PYTHONPATH 生效)
 //! - `hotupdate` : 后端热更新流程(查 PyPI -> 下载 -> 依赖解析 -> 解压 -> 激活)
+//! - `patch`     : 本地补丁层(sitecustomize 钩子打同版本修正,与 overlay 语义不同)
 //! - `winproc`   : Windows 作业对象与进程映像查询(退出时保证不留孤儿进程)
 //! - `ca`        : CA 信任合并(certifi + Windows 证书库根),供子进程 HTTPS 校验
 //! - `python`    : 解释器探测与依赖检查
@@ -16,6 +17,7 @@ pub mod ca;
 pub mod runtime;
 pub mod overlay;
 pub mod hotupdate;
+pub mod patch;
 pub mod winproc;
 pub mod python;
 pub mod runner;

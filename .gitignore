@@ -20,6 +20,12 @@ build/
 # 由 scripts/fetch-runtimes.ps1 组装的自包含运行时(内置 Python + Node,数百 MB,不进 git)
 src-tauri/runtimes/
 
+# B 站登录凭据(SESSDATA 等)—— 绝不入库。
+# 正常路径下它只出现在用户目录 %LOCALAPPDATA%\DeepTutor\patches\,
+# 这里的规则是第二道防线:万一有人把凭据拷回仓库,也不会被提交。
+**/bili_credentials.json
+*.credentials.json
+
 # DeepTutor 运行时配置(deeptutor.api.run_server 自动创建)
 data/
 
@@ -33,3 +39,6 @@ tmp/
 
 # 本地临时探测目录
 .tmp/
+
+# 本地工作记忆与探测日志(从未入库;项目数据请放工作区 .workbuddy,不要入 git)
+.workbuddy/
