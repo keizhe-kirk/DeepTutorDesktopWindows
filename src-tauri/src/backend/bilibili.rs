@@ -159,6 +159,162 @@ pub async fn clear(app: &AppHandle) -> Result<LoginOutcome, String> {
     run_quick(app, "clear").await
 }
 
+// --------------------------------------------------------------------------
+// 搜索
+// --------------------------------------------------------------------------
+
+/// 一条搜索结果。
+///
+/// ★ 必须同时 `Serialize`：它要作为 Tauri command 的返回值**跨 IPC 传给前端**。
+///
+/// ★ 字段名与补丁包 `dtpatch_bili/search.py` 的 `_row_to_item` 逐字对应。
+/// 之前只留了 6 个字段，`thumbnail_url` 在这里被 serde 静默丢掉 —— 前端拿到的
+/// 列表**没有封面**，而封面对「一眼找到那条视频」至关重要。补字段时两边一起改。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SearchHit {
+    #[serde(default)]
+    pub bvid: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub author: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub duration_seconds: f64,
+    #[serde(default)]
+    pub play_count: f64,
+    /// 封面地址。★ B 站给的是**协议相对 URL**（`//i0.hdslb.com/...`），
+    /// 前端必须补成 https，这里原样透传、不在 Rust 侧改写。
+    #[serde(default)]
+    pub thumbnail_url: String,
+    /// 发布时间（Unix 秒）。
+    #[serde(default)]
+    pub published_at: i64,
+    /// 简介片段，用来区分同名视频。
+    #[serde(default)]
+    pub description: String,
+}
+
+/// 搜索响应。
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct SearchOutcome {
+    #[serde(default)]
+    pub results: Vec<SearchHit>,
+    #[serde(default)]
+    pub error: String,
+    #[serde(default)]
+    pub keyword: String,
+    #[serde(default)]
+    pub page: u32,
+    /// 全部结果数（B 站的 `numResults`，只是个估计值）。
+    #[serde(default)]
+    pub total_results: u64,
+    /// 总页数（B 站的 `numPages`）。0 表示后端没给。
+    #[serde(default)]
+    pub page_count: u32,
+    /// 还有下一页吗。前端据此决定「下一页」按钮是否可点。
+    #[serde(default)]
+    pub has_more: bool,
+}
+
+/// 站内搜索。
+///
+/// ★ 复用补丁包里的 `dtpatch_bili.search_cli`（它内部调`search.py`），
+/// **不在 Rust 侧重写一遍** —— 同一份实现，避免两边行为漂移。
+///
+/// 契约：stdout **只有一个** JSON 对象，日志全在 stderr。
+pub async fn search(app: &AppHandle, keyword: &str, page: u32) -> Result<SearchOutcome, String> {
+    let keyword = keyword.trim();
+    if keyword.is_empty() {
+        return Err("请输入搜索关键词。".into());
+    }
+    log::info!("B 站搜索: keyword={keyword:?} page={page}");
+    let (python, patch_dir) = command_parts(app).ok_or("后端管理器尚未就绪，请稍后重试。")?;
+    if !patch_dir.join("dtpatch_bili").is_dir() {
+        return Err("本地补丁尚未就位，请先启动一次后端。".into());
+    }
+
+    let mut cmd = Command::new(&python);
+    cmd.arg("-P")
+        .arg("-m")
+        .arg("dtpatch_bili.search_cli")
+        .arg(keyword)
+        .arg(page.to_string())
+        .current_dir(&patch_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        // 补丁目录必须在 PYTHONPATH 上，脚本才 import 得到。
+        .env("PYTHONPATH", &patch_dir)
+        .env("DEEPTUTOR_PATCH_HOME", &patch_dir);
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.as_std_mut().creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = tokio::time::timeout(Duration::from_secs(45), cmd.output())
+        .await
+        .map_err(|_| "搜索超时（B 站接口无响应），请稍后重试。".to_string())?
+        .map_err(|e| format!("无法启动搜索：{e}"))?;
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let parsed = text
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let t = line.trim();
+            if t.starts_with('{') && t.ends_with('}') {
+                serde_json::from_str::<SearchOutcome>(t).ok()
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| {
+            let err = String::from_utf8_lossy(&output.stderr);
+            let hint = err.lines().last().unwrap_or("").trim().to_string();
+            if hint.is_empty() {
+                "无法解析搜索结果。".to_string()
+            } else {
+                format!("搜索失败：{}", hint.chars().take(120).collect::<String>())
+            }
+        })?;
+
+    if !parsed.error.is_empty() && parsed.results.is_empty() {
+        log::warn!("B 站搜索失败: {}", parsed.error);
+        return Err(parsed.error);
+    }
+    log::info!(
+        "B 站搜索完成: {} 条, has_more={}, total={}",
+        parsed.results.len(),
+        parsed.has_more,
+        parsed.total_results
+    );
+    Ok(normalize_outcome(parsed, page))
+}
+
+/// 补齐分页字段。
+///
+/// 老补丁的 search_cli 只回 `results/error/keyword/page`，不带分页信息。
+/// 这里做一次兜底，让前端不用关心补丁版本 —— 判据只有一个：
+/// **整页放满就认为还有下一页**（`MAX_RESULTS` 是 20，与 search.py 一致）。
+fn normalize_outcome(mut out: SearchOutcome, requested_page: u32) -> SearchOutcome {
+    const PAGE_SIZE: usize = 20;
+    if out.page == 0 {
+        out.page = requested_page;
+    }
+    if out.page_count > 0 {
+        out.has_more = out.page < out.page_count;
+    } else {
+        out.has_more = out.results.len() >= PAGE_SIZE;
+    }
+    out
+}
+
 /// 引导用户扫码登录。
 ///
 /// 会在浏览器里打开 B 站登录页，阻塞等待到用户完成或超时。

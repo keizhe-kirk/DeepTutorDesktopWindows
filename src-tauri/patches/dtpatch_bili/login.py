@@ -38,6 +38,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import time
 import urllib.request
@@ -56,6 +57,18 @@ BROWSERS = (
 )
 
 _LOGIN_PAGE = "https://passport.bilibili.com/login"
+
+
+def log(message: str) -> None:
+    """写到 stderr。
+
+    ★ 必须走 stderr 且即时 flush：Rust 侧把 stdout 当作**结果通道**
+    （只解析最后一行 JSON），任何往 stdout 打的调试信息都会污染它。
+    """
+    try:
+        print(f"[dtpatch.bili.login] {message}", file=sys.stderr, flush=True)
+    except Exception:  # noqa: BLE001 - 日志绝不能影响登录本身
+        pass
 
 
 def find_browser() -> str | None:
@@ -173,46 +186,100 @@ def _http_json(url: str, timeout: float = 2.0):
         return None
 
 
-def _read_cookies_via_cdp(port: int, timeout: float) -> dict[str, str]:
-    """Open a CDP target on bilibili and dump its cookies."""
+def _pick_target(info: object) -> str:
+    """从 `/json/list` 里挑一个该问的 target，返回其 ws url（空串=没有）。"""
+    if not isinstance(info, list):
+        return ""
+    # ① 优先 bilibili 页面 —— 只有它的 cookie jar 里才有我们要的东西。
+    for target in info:
+        if not isinstance(target, dict):
+            continue
+        if "bilibili.com" in str(target.get("url") or "") and target.get("webSocketDebuggerUrl"):
+            return str(target["webSocketDebuggerUrl"])
+    # ② 退而求其次：任意普通页面。★ 必须排除 background_page ——
+    # Edge/Chrome 启动时会带一票扩展的 background_page，它们的 cookie jar
+    # 里绝不会有 .bilibili.com 的东西，握上去必然空手而归。
+    for target in info:
+        if not isinstance(target, dict):
+            continue
+        if target.get("type") == "page" and target.get("webSocketDebuggerUrl"):
+            return str(target["webSocketDebuggerUrl"])
+    return ""
 
-    deadline = time.monotonic() + timeout
-    ws_url = ""
-    while time.monotonic() < deadline:
-        info = _http_json(f"http://127.0.0.1:{port}/json/list")
-        if isinstance(info, list):
-            for target in info:
-                if not isinstance(target, dict):
-                    continue
-                url = str(target.get("url") or "")
-                if "bilibili.com" in url and target.get("webSocketDebuggerUrl"):
-                    ws_url = str(target["webSocketDebuggerUrl"])
-                    break
-                if not ws_url and target.get("webSocketDebuggerUrl") and target.get("type") == "page":
-                    ws_url = str(target["webSocketDebuggerUrl"])
-            if ws_url:
-                break
-        time.sleep(0.6)
-    if not ws_url:
-        return {}
 
+def _dump_wanted_cookies(ws_url: str) -> dict[str, str]:
+    """在给定 target 上问一次 cookie，只保留 WANTED 里的。"""
     ws = _WS(ws_url)
     try:
         ws.send(json.dumps({"id": 1, "method": "Network.getAllCookies"}))
         for _ in range(12):
             message = json.loads(ws.recv())
-            if message.get("id") == 1:
-                found: dict[str, str] = {}
-                for cookie in message.get("result", {}).get("cookies", []):
-                    name = str(cookie.get("name") or "")
-                    if name in WANTED:
-                        value = str(cookie.get("value") or "").strip()
-                        if value:
-                            found[name] = value
-                return found
+            if message.get("id") != 1:
+                continue
+            if "error" in message:
+                log(f"CDP 返回错误: {message['error']}")
+                return {}
+            found: dict[str, str] = {}
+            for cookie in message.get("result", {}).get("cookies", []):
+                name = str(cookie.get("name") or "")
+                if name in WANTED:
+                    value = str(cookie.get("value") or "").strip()
+                    if value:
+                        found[name] = value
+            return found
     finally:
         ws.close()
     return {}
+
+
+def _read_cookies_via_cdp(port: int, timeout: float) -> dict[str, str]:
+    """轮询 CDP，直到拿到 SESSDATA 或超时。
+
+    ★ 关键：**必须反复轮询到超时为止**，不能只问一次就返回。
+    登录页刚打开时用户还没扫码，此刻 cookie jar 里必然是空的 —— 问一次
+    就返回等于「用户永远来不及扫码」。之前正是这么写的，于是无论用户扫
+    多快，脚本都在扫码前就结束，界面只显示「没有取到登录态」。
+    """
+    deadline = time.monotonic() + timeout
+    # 每次查询都重取 target：登录后页面会跳转（passport -> 主页），
+    # 拿旧的 target 句柄会一直读到那个已经消失的页面。
+    while time.monotonic() < deadline:
+        ws_url = _pick_target(_http_json(f"http://127.0.0.1:{port}/json/list"))
+        if ws_url:
+            try:
+                found = _dump_wanted_cookies(ws_url)
+            except Exception as exc:  # noqa: BLE001 - 页面可能正在导航
+                log(f"读取 cookie 失败（页面可能正在跳转）: {exc!r}")
+                found = {}
+            if "SESSDATA" in found:
+                return found
+        time.sleep(1.0)
+    return {}
+
+
+def _cleanup(profile: Path, proc: subprocess.Popen | None) -> None:
+    """关浏览器、删临时 profile。**每一步都不许抛**。
+
+    ★ 删不掉是常态而非异常：浏览器退出有延迟，profile 里的文件可能仍被
+    占用；而本机的删除还会被安全策略拦（safe-delete shim 改走回收站）。
+    所以这里一律 `ignore_errors` + 记日志 —— 清理失败绝不能影响登录结果，
+    只是会在临时目录里留下一个可以下次再清的目录。
+    """
+    if proc is not None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=8)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+    try:
+        shutil.rmtree(profile, ignore_errors=True)
+    except Exception:  # noqa: BLE001
+        pass
+    if profile.exists():
+        log(f"临时 profile 未完全清理（可忽略，下次启动会复用）: {profile}")
 
 
 def login(timeout: float = 300.0) -> dict[str, str]:
@@ -223,6 +290,7 @@ def login(timeout: float = 300.0) -> dict[str, str]:
 
     browser = find_browser()
     if not browser:
+        log("未找到 Edge/Chrome，无法引导登录")
         return {}
 
     port = _free_port()
@@ -230,38 +298,41 @@ def login(timeout: float = 300.0) -> dict[str, str]:
     profile = Path(tempfile.gettempdir()) / f"dt-bili-login-{os.getpid()}"
     profile.mkdir(parents=True, exist_ok=True)
 
-    proc = subprocess.Popen(
-        [
-            browser,
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={profile}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--new-window",
-            _LOGIN_PAGE,
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    log(f"启动 {browser}（调试端口 {port}）")
+    try:
+        proc = subprocess.Popen(
+            [
+                browser,
+                f"--remote-debugging-port={port}",
+                f"--user-data-dir={profile}",
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--new-window",
+                _LOGIN_PAGE,
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception as exc:  # noqa: BLE001
+        log(f"启动浏览器失败: {exc!r}")
+        _cleanup(profile, None)
+        return {}
 
     try:
         found = _read_cookies_via_cdp(port, timeout)
         if "SESSDATA" in found:
             cred.save_cookies(found)
+            log("已取到 SESSDATA，登录成功")
             return found
+        # ★ 超时也要说清原因。前端据此区分「用户没扫」与「扫了但没成」，
+        # 而笼统的「没有取到登录态」会让用户以为是自己操作错了。
+        log("等待超时：始终没有取到 SESSDATA（未扫码，或扫码未成功）")
         return {}
-    except Exception:  # noqa: BLE001 - login is optional, never fatal
+    except Exception as exc:  # noqa: BLE001 - login is optional, never fatal
+        log(f"登录过程异常: {exc!r}")
         return {}
     finally:
-        try:
-            proc.terminate()
-            proc.wait(timeout=8)
-        except Exception:  # noqa: BLE001
-            try:
-                proc.kill()
-            except Exception:  # noqa: BLE001
-                pass
-        shutil.rmtree(profile, ignore_errors=True)
+        _cleanup(profile, proc)
 
 
 async def status() -> dict[str, str]:

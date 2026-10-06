@@ -68,7 +68,9 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
             &MenuItem::with_id(app, "backend-update", "检查后端更新…", true, None::<&str>)?,
             &MenuItem::with_id(app, "backend-rollback", "回退到内置后端", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app)?,
-            // 设置组:B 站字幕需要登录态,没登录态时「边看边学」只剩播放。
+            // 设置组:先把「找视频」的入口放在最前面 —— 没有入口的功能等于没有。
+            &MenuItem::with_id(app, "bili-search", "搜索哔哩哔哩…", true, None::<&str>)?,
+            // B 站字幕需要登录态,没登录态时「边看边学」只剩播放。
             &MenuItem::with_id(app, "bili-login", "登录哔哩哔哩（获取字幕）…", true, None::<&str>)?,
             &MenuItem::with_id(app, "bili-logout", "清除哔哩哔哩登录", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app)?,
@@ -129,6 +131,15 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
                 tauri::async_runtime::spawn(async move {
                     run_bilibili_login_flow(handle).await;
                 });
+            }
+            "bili-search" => {
+                // 开窗是同步动作（要在 UI 线程拿Webview），失败弹说明框。
+                if let Err(e) = crate::bili_search_window::open(app) {
+                    let handle = app.clone();
+                    tauri::async_runtime::spawn(async move {
+                        info_dialog(&handle, "无法打开搜索窗口", &e.to_string()).await;
+                    });
+                }
             }
             "bili-logout" => {
                 let handle = app.clone();

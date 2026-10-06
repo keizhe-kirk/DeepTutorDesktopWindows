@@ -21,6 +21,7 @@ pub mod ima;
 pub mod tray;
 pub mod updater;
 pub mod autostart;
+pub mod bili_search_window;
 
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
 
@@ -94,6 +95,28 @@ pub fn run() {
 
             // 启动系统托盘(Tauri 2 内置 API)
             tray::setup(app.handle())?;
+            // 诊断开关：设了 DEEPTUTOR_OPEN_BILI_SEARCH 就启动后把 B 站搜索
+            // 窗口开出来。它的正式入口是托盘菜单，而托盘点不点得动没法自动化
+            // —— 留这个开关是为了真机能一键验证那扇窗口(CSP/IPC/缩略图/关窗)。
+            // 平时不设，等于没有这段代码。
+            //
+            // ★ 不能在 setup() 里同步开：窗口要等消息循环跑起来才能建，
+            // 否则是竞态（实测会随机报 0x80070578「无效的窗口句柄」然后
+            // 窗口静默消失）。所以推迟到主/UI 线程上再开。
+            if std::env::var_os("DEEPTUTOR_OPEN_BILI_SEARCH").is_some() {
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(900));
+                    let inner = handle.clone();
+                    if let Err(e) = handle.run_on_main_thread(move || {
+                        if let Err(e) = bili_search_window::open(&inner) {
+                            log::warn!("启动时打开 B 站搜索窗口失败: {e}");
+                        }
+                    }) {
+                        log::warn!("调度搜索窗口打开失败: {e}");
+                    }
+                });
+            }
             // 注册 IMA 自定义协议路由
             ima::protocol::register(app.handle())?;
             // 启动后端引导流程(异步,不阻塞窗口显示)
@@ -151,6 +174,8 @@ pub fn run() {
             commands::check_backend_update,
             commands::install_backend_update,
             commands::rollback_backend,
+            commands::bili_search,
+            commands::bili_open,
         ])
         .build(tauri::generate_context!())
         .expect("error while building DeepTutor shell");
@@ -336,5 +361,44 @@ mod commands {
     #[tauri::command]
     pub async fn rollback_backend(app: AppHandle) -> Result<String, String> {
         hotupdate::rollback(&app).await
+    }
+
+    // ---- B 站搜索窗口（见 `crate::bili_search_window` 的模块文档）----
+    //
+    // 这两个 command 是**搜索窗口那页 HTML 唯一的出口**。前端是上游
+    // Next.js 的编译产物、加不了 B 站 UI，所以入口只能自己搭；搜索逻辑
+    // 仍在补丁包里，这里只做转发。
+
+    /// 搜索 B 站视频。
+    #[tauri::command]
+    pub async fn bili_search(
+        app: AppHandle,
+        keyword: String,
+        page: Option<u32>,
+    ) -> Result<crate::backend::bilibili::SearchOutcome, String> {
+        crate::backend::bilibili::search(&app, &keyword, page.unwrap_or(1)).await
+    }
+
+    /// 用系统默认浏览器打开一个 B 站视频。
+    ///
+    /// ★ 只允许 `bilibili.com` 域 —— 搜索结果里的 URL 来自网络响应，
+    /// 直接丢给 shell 打开等于给了任意 URL 拉起外部程序的机会。
+    #[allow(deprecated)]
+    #[tauri::command]
+    pub fn bili_open(app: AppHandle, url: String) -> Result<(), String> {
+        use tauri_plugin_shell::ShellExt;
+        let lower = url.to_ascii_lowercase();
+        if !lower.starts_with("https://www.bilibili.com/")
+            && !lower.starts_with("https://bilibili.com/")
+        {
+            return Err("只允许打开 bilibili.com 的链接。".into());
+        }
+        // 有意用 deprecated 的 `Shell::open`：它在本项目已注册的
+        // `tauri-plugin-shell` 里，功能完好。换成 `tauri-plugin-opener`
+        // 需要新增依赖并配 capability，属于无谓的连带改动 —— 等上游把
+        // shell 插件整体迁走时再一并处理。
+        app.shell()
+            .open(&url, None)
+            .map_err(|e| format!("打开失败：{e}"))
     }
 }

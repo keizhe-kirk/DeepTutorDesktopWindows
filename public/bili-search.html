@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>搜索哔哩哔哩</title>
+<link rel="stylesheet" href="bili-search.css" />
+</head>
+<body>
+  <h1>搜索哔哩哔哩</h1>
+  <div class="row">
+    <input id="q" type="text" placeholder="输入关键词，如「线性代数」" autofocus autocomplete="off" />
+    <button id="go">搜索</button>
+  </div>
+  <div class="row" style="margin-top:8px">
+    <button id="prev" class="ghost">上一页</button>
+    <button id="next" class="ghost">下一页</button>
+    <span id="pageinfo" class="pageinfo"></span>
+  </div>
+  <div id="status"></div>
+  <div id="list"></div>
+  <div class="hint">
+    点一条结果，用<b>默认浏览器</b>打开该视频；再把它粘到 DeepTutor 的
+    「边看边学」里，即可带字幕学习。<br />
+    <kbd>Enter</kbd> 搜索 · <kbd>Esc</kbd> 关闭本窗口
+  </div>
+
+<!--
+  ★ 必须用**外链脚本**而不是内联 <script>：
+  tauri.conf 的 CSP 是 `script-src 'self'`，内联脚本会被 WebView2 拦掉，
+  表现为「窗口打开了但按钮没反应」，极难排查。
+  同理样式也外链（虽然 `style-src 'unsafe-inline'` 放行了内联，
+  统一外链更省心）。
+-->
+<script src="bili-search.js"></script>
+</body>
+</html>

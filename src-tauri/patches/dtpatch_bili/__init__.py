@@ -35,6 +35,16 @@ import os
 from pathlib import Path
 from typing import Any
 
+# ★ 字幕是自己抓的，不用上游那条路 —— 原因见 `_fetch_bilibili_media` 的文档。
+# 保留这两个名字是为了复用上游已经写好的「分段归一化」逻辑，避免重复实现。
+from deeptutor.reading.ingestion import (  # noqa: E402
+    MAX_TRANSCRIPT_BYTES,
+    BilibiliMedia,
+    build_transcript_segments,
+    normalize_transcript_segments,
+    parse_bilibili_url,
+)
+
 PROVIDER = "bilibili"
 
 #: 字幕来源标识，写进 ``transcript.source``，前端据此提示用户。
@@ -46,10 +56,22 @@ SOURCE_DISABLED = "disabled"
 _MAX_TITLE = 200
 
 
-def _log(msg: str) -> None:
+def _log(msg: str, *args: object) -> None:
+    """记一行日志到 **stderr**。
+
+    ★ 必须走 stderr：Rust 侧把 stdout 当作**结果通道**（只解析最后一行
+    JSON），任何往 stdout 打的调试信息都会污染结果。
+
+    支持 printf 风格（``_log("x=%s", v)``）—— 这样和模块里已有的
+    ``_log("...%s", exc)`` 调用风格一致，不必逐处改成 f-string。
+    """
     import sys
 
-    print(f"[dtpatch.bili] {msg}", file=sys.stderr, flush=True)
+    try:
+        text = msg % args if args else str(msg)
+    except Exception:  # noqa: BLE001 - 格式化失败不能连带打崩业务
+        text = f"{msg} {args!r}"
+    print(f"[dtpatch.bili] {text}", file=sys.stderr, flush=True)
 
 
 def _looks_like_bilibili(url: str) -> bool:
@@ -140,18 +162,205 @@ def _segments_to_cues(segments: list[Any]) -> list[dict[str, Any]]:
     return cues
 
 
+# --------------------------------------------------------------------------
+# 字幕抓取：自己实现，不用上游的``_load_bilibili_media``
+# --------------------------------------------------------------------------
+
+#: B 站 Web API 的固定域名。字幕 CDN 在``*.hdslb.com``。
+_API = "https://api.bilibili.com"
+
+#: 真实浏览器 UA。用``DeepTutor/ImmersiveReading`` 这类自定义 UA 会被
+#: B 站当成爬虫，字幕接口直接返回空列表（实测）。
+_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
+)
+
+#: 字幕语言偏好（按顺序）。``ai-zh`` 是 B 站自动生成的中文轴，
+#: 覆盖率远高于人工上传，所以排第一 —— 否则很多视频一条字幕都匹配不上。
+_SUBTITLE_PREFERENCE = ("zh-CN", "ai-zh", "zh-Hans", "zh_CN", "zh", "ai-en", "en")
+
+
+def _pick_subtitle(rows: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """从字幕列表里挑一条：有 URL 的优先，其次按语言偏好。"""
+    usable = [r for r in rows if str(r.get("subtitle_url") or "").strip()]
+    if not usable:
+        return None
+    for wanted in _SUBTITLE_PREFERENCE:
+        for row in usable:
+            lan = str(row.get("lan") or "").strip()
+            if lan.lower() == wanted.lower():
+                return row
+    return usable[0]
+
+
+def _absolute(url: str) -> str:
+    """把 B 站返回的协议相对/ http URL 统一成 https。
+
+    ★ 必须强制 https：``view`` 接口的 ``pic`` 字段实测会返回 ``http://``，
+    而 DeepTutor 的页面本身是 https，浏览器会把 http 封面拦成混合内容
+    ——表现为「视频能播但封面空白」。
+    """
+    url = url.strip()
+    if url.startswith("//"):
+        return f"https:{url}"
+    if url.lower().startswith("http://"):
+        return f"https://{url[7:]}"
+    return url
+
+
+def _is_subtitle_cdn(url: str) -> bool:
+    """只允许 B 站自己的字幕 CDN（与上游同样的安全约束）。"""
+    from urllib.parse import urlparse
+
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return parsed.scheme == "https" and (
+        host == "hdslb.com" or host.endswith(".hdslb.com")
+    )
+
+
+async def _fetch_bilibili_media(request: Any, languages: Any) -> BilibiliMedia:
+    """抓 B 站元数据 + 字幕 + 章节。
+
+    ★ 为什么不能直接用上游 ``_load_bilibili_media``（实测三重失效）：
+
+    1. **接口错了。** 上游打的是 ``/x/player/v2``，而 B 站现在只在
+       ``/x/player/wbi/v2`` 里返回 ``subtitle_url``。同一个视频同一份cookie，
+       前者 6 条字幕但每条 ``subtitle_url`` **都是空字符串**，后者才带真实
+       CDN 地址 —— 上游那行 ``if subtitle_url:`` 于是直接跳过，字幕恒为空。
+    2. **不带cookie。** 上游的 headers 只有 Accept/Referer/UA，没有 Cookie，
+       所以用户扫码登录对它**毫无作用** —— 登录功能等于白做。
+    3. **UA 被识别为爬虫。** ``Mozilla/5.0 DeepTutor/ImmersiveReading``
+       不是浏览器 UA，字幕接口会返回空列表。
+
+    三条都实测过（BV1d7wAzsE8V，登录态下）：``nav`` 确认
+    ``isLogin=True``、``player/v2`` 与 ``player/wbi/v2`` 都是 6 条字幕，
+    但只有后者带 URL。
+    """
+
+    try:
+        import httpx
+    except ImportError as exc:  # pragma: no cover
+        raise RuntimeError("Bilibili import requires httpx") from exc
+
+    langs = _language_list(languages)
+    cookies = _credentials()
+    headers = {
+        "Accept": "application/json",
+        "Referer": "https://www.bilibili.com/",
+        "User-Agent": _UA,
+    }
+    if cookies:
+        headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+
+    async with httpx.AsyncClient(
+        timeout=15, follow_redirects=True, headers=headers
+    ) as client:
+
+        async def api(path: str, params: dict[str, Any]) -> dict[str, Any]:
+            resp = await client.get(f"{_API}{path}", params=params)
+            data = resp.json()
+            if not isinstance(data, dict) or data.get("code") != 0:
+                raise RuntimeError(
+                    f"Bilibili 接口 {path} 返回 code="
+                    f"{(data or {}).get('code') if isinstance(data, dict) else '?'}"
+                )
+            payload = data.get("data")
+            return payload if isinstance(payload, dict) else {}
+
+        view = await api("/x/web-interface/view", {"bvid": request.bvid})
+        pages = view.get("pages") if isinstance(view.get("pages"), list) else []
+        if not pages:
+            raise RuntimeError("Bilibili 未返回可播放分P")
+
+        page_index = min(int(getattr(request, "page_number", 1) or 1), len(pages)) - 1
+        page = pages[page_index] if isinstance(pages[page_index], dict) else {}
+        cid = int(page.get("cid") or 0)
+        if cid <= 0:
+            raise RuntimeError("Bilibili 未返回 cid")
+
+        duration = float(page.get("duration") or view.get("duration") or 0)
+        title = str(page.get("part") or view.get("title") or request.bvid).strip()
+        cover = _absolute(str(view.get("pic") or ""))
+
+        # ---- 章节 ----
+        chapters: list[Any] = []
+        # ---- 字幕 ----
+        segments: list[Any] = []
+        try:
+            # ★ 关键：必须用 wbi 版，且 cid 要用真实值（不是 1）。
+            player = await api(
+                "/x/player/wbi/v2", {"bvid": request.bvid, "cid": cid}
+            )
+        except Exception as exc:  # noqa: BLE001 - 字幕失败不该拖垮整条链路
+            _log("播放器接口不可用（%s），仅返回元数据", exc)
+            player = {}
+
+        from deeptutor.reading.ingestion import normalize_transcript_segments as _norm
+
+        chapters = build_transcript_segments(_norm(player.get("view_points") or []))
+
+        subtitle_root = player.get("subtitle")
+        rows = (
+            subtitle_root.get("subtitles")
+            if isinstance(subtitle_root, dict)
+            and isinstance(subtitle_root.get("subtitles"), list)
+            else []
+        )
+        chosen = _pick_subtitle(rows)
+        if chosen:
+            url = _absolute(str(chosen.get("subtitle_url") or ""))
+            if _is_subtitle_cdn(url):
+                try:
+                    resp = await client.get(url)
+                    if len(resp.content) > MAX_TRANSCRIPT_BYTES * 2:
+                        _log("字幕体积超限，忽略")
+                    else:
+                        resp.raise_for_status()
+                        payload = resp.json()
+                        body = (
+                            payload.get("body")
+                            if isinstance(payload, dict)
+                            and isinstance(payload.get("body"), list)
+                            else []
+                        )
+                        segments = build_transcript_segments(_norm(body))
+                        _log(
+                            "已取到字幕 lan=%s 条数=%d",
+                            chosen.get("lan"),
+                            len(segments),
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    _log("字幕下载失败: %s", exc)
+            else:
+                _log("字幕 URL 不在 B 站 CDN 上，拒绝: %s", url[:60])
+
+    return BilibiliMedia(
+        title=title,
+        cover_url=cover,
+        duration_seconds=duration,
+        page_number=page_index + 1,
+        cid=cid,
+        segments=segments,
+        chapters=chapters,
+    )
+
+
 async def _resolve_bilibili(module, url: str, language: Any) -> dict[str, Any]:
     """Produce the same material dict ``resolve_material`` would, for Bilibili."""
 
     request = _parse(url)  # may raise ReadingError -> caller maps it
     cookies = _credentials()
 
-    from deeptutor.reading.ingestion import ReadingError, _load_bilibili_media
+    from deeptutor.reading.ingestion import ReadingError
 
     langs = _language_list(language)
 
+    # ★ 走自己的实现（见 ``_fetch_bilibili_media`` 的文档：上游那条路
+    # 接口选错 + 不带 cookie + UA 被当爬虫，三重失效）。
     try:
-        media = await _load_bilibili_media(request.canonical_url, langs)
+        media = await _fetch_bilibili_media(request, langs)
     except ReadingError:
         raise
     except Exception as exc:  # noqa: BLE001 - surface as a user-facing failure

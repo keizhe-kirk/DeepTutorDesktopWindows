@@ -229,10 +229,25 @@ async def search(
         if len(items) >= MAX_RESULTS:
             break
 
+    data = payload.get("data") or {}
+
+    def _int(value: Any) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    page_count = _int(data.get("numPages"))
+    total_results = _int(data.get("numResults"))
     return {
         "results": items,
         "error": "",
         "keyword": term,
         "page": page,
+        # 之前只有 `total`（本页条数），前端无从判断「还有没有下一页」。
+        # 这里把 B 站给的两个真值透出去，`has_more` 由它俩决定。
         "total": len(items),
+        "page_count": page_count,
+        "total_results": total_results,
+        "has_more": bool(page_count and page < page_count),
     }

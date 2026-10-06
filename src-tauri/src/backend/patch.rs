@@ -65,6 +65,16 @@ const STATE_FILENAME: &str = "state.json";
 const MANIFEST_FILENAME: &str = "patch.json";
 /// 启动钩子文件名 —— Python 会在启动时自动 import 它。
 pub const SITECUSTOMIZE_FILENAME: &str = "sitecustomize.py";
+/// 补丁包（真正的 Python 实现）所在的目录名。
+pub const PATCH_PACKAGE_DIRNAME: &str = "dtpatch_bili";
+
+/// 播种时从安装目录带过去的条目。
+///
+/// ★ **比对与拷贝都吃这一份清单** —— 加新补丁文件时只改这里，
+/// 两边不会漂。之前比对只看 `sitecustomize.py` + `patch.json`，于是
+/// 「只改了补丁包里某个 `.py`」的更新会被判为「没变」而跳过拷贝，
+/// 用户目录里的补丁永远停在旧版，且没有任何症状。
+const SEEDED_ENTRIES: [&str; 3] = [MANIFEST_FILENAME, SITECUSTOMIZE_FILENAME, PATCH_PACKAGE_DIRNAME];
 
 /// 补丁清单(`patch.json`)。
 ///
@@ -317,23 +327,13 @@ impl Patches {
 
         // ---- 内容比对与拷贝 ----
         //
-        // ★ 参与比对的**必须包含清单**:清单是适用性判据的真相来源,只在
-        // sitecustomize 没变时就跳过拷贝,会让「补丁发版新增了一个已验证版本」
-        // 这类更新永远落不到用户目录 —— 症状是新装用户功能残缺,而机器上
-        // 明明有那个版本的补丁。
-        let contents_match = [SITECUSTOMIZE_FILENAME, MANIFEST_FILENAME]
+        // ★ 参与比对的**必须和拷贝名单是同一份清单**（[`SEEDED_ENTRIES`]）。
+        // 之前只比对 sitecustomize + 清单，于是「只改了补丁包里某个 .py」
+        // 这类更新**永远落不到用户目录** —— 比对说「没变」，跳过拷贝。
+        // 症状是新装用户功能残缺，而机器上明明有那份新补丁，最难查。
+        let contents_match = SEEDED_ENTRIES
             .iter()
-            .all(|name| {
-                match (
-                    std::fs::read(source.join(name)),
-                    std::fs::read(target_root.join(name)),
-                ) {
-                    (Ok(a), Ok(b)) => a == b,
-                    // 源里没有该文件(老补丁无清单)时,只在目标也没有时算一致。
-                    (Err(_), Err(_)) => true,
-                    _ => false,
-                }
-            });
+            .all(|name| entry_matches(&source.join(name), &target_root.join(name)));
         if contents_match {
             if state_dirty {
                 let _ = write_state_at(target_root, &state);
@@ -344,12 +344,10 @@ impl Patches {
         let copy_result = (|| -> Result<()> {
             std::fs::create_dir_all(target_root)
                 .with_context(|| format!("创建补丁目录失败: {}", target_root.display()))?;
-            // ★ 只拷这三个名字:清单 + sitecustomize + 补丁包。
+            // ★ 只拷 [`SEEDED_ENTRIES`] 里这几个名字。
             // 绝不能整目录搬 —— 用户目录里还放着 `bili_credentials.json`,
             // 那是扫码产生的凭据,覆盖式播种会把它连同旧内容一起抹掉。
-            // 新增补丁文件时必须同步改这里(测试 `credentials_survive_reseeding`
-            // 只钉住了「凭据不被碰」,不钉住「该拷的都拷了」)。
-            for name in [MANIFEST_FILENAME, SITECUSTOMIZE_FILENAME, "dtpatch_bili"] {
+            for name in SEEDED_ENTRIES {
                 let from = source.join(name);
                 let to = target_root.join(name);
                 if from.is_dir() {
@@ -402,7 +400,8 @@ impl Patches {
             }
         }
         roots.into_iter().find(|dir| {
-            dir.join(SITECUSTOMIZE_FILENAME).is_file() && dir.join("dtpatch_bili").is_dir()
+            dir.join(SITECUSTOMIZE_FILENAME).is_file()
+                && dir.join(PATCH_PACKAGE_DIRNAME).is_dir()
         })
     }
 
@@ -428,6 +427,64 @@ fn write_state_at(root: &Path, state: &PatchState) -> Result<()> {
     std::fs::write(root.join(STATE_FILENAME), serde_json::to_string_pretty(state)?)
         .with_context(|| format!("写入补丁状态失败: {}", root.join(STATE_FILENAME).display()))?;
     Ok(())
+}
+
+/// 源与目标里的某个条目（文件或目录）内容是否一致。
+///
+/// 两边都没有算一致（老补丁没有清单时的兼容路径，与播种时跳过缺失源同语义）。
+fn entry_matches(from: &Path, to: &Path) -> bool {
+    if from.is_dir() || to.is_dir() {
+        return dir_contents_match(from, to);
+    }
+    match (std::fs::read(from), std::fs::read(to)) {
+        (Ok(a), Ok(b)) => a == b,
+        (Err(_), Err(_)) => true,
+        _ => false,
+    }
+}
+
+/// 递归比对目录内容。跳过 `__pycache__` —— 必须与 [`copy_dir`] 同规则，
+/// 否则目标里跑出来的编译缓存会让比对**永不相等**，于是每次启动都重播种。
+///
+/// 两边都没有该目录算一致（见 [`entry_matches`]）。
+fn dir_contents_match(from: &Path, to: &Path) -> bool {
+    if !from.is_dir() && !to.is_dir() {
+        return true;
+    }
+    match (collect_tree(from), collect_tree(to)) {
+        (Some(a), Some(b)) => a == b,
+        // 任意一边读不动就当作不一致：宁可多拷一次，也不要漏掉更新。
+        _ => false,
+    }
+}
+
+/// 把目录收成「排序后的 (相对路径, 内容)」列表，便于直接比等。
+///
+/// 补丁包总共几十 KB，读进内存比对是零成本；换来的是**逐字节确定性**，
+/// 不依赖任何哈希实现（`DefaultHasher` 的取值会随 Rust 版本变，
+/// 那会造成无谓的重播种）。
+fn collect_tree(root: &Path) -> Option<Vec<(String, Vec<u8>)>> {
+    let mut out = Vec::new();
+    collect_into(root, root, &mut out)?;
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    Some(out)
+}
+
+fn collect_into(root: &Path, dir: &Path, out: &mut Vec<(String, Vec<u8>)>) -> Option<()> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        // 与 `copy_dir` 同规则：编译缓存不参与比对。
+        if entry.file_name() == "__pycache__" {
+            continue;
+        }
+        let path = entry.path();
+        let rel = path.strip_prefix(root).ok()?.to_string_lossy().replace('\\', "/");
+        if path.is_dir() {
+            collect_into(root, &path, out)?;
+        } else {
+            out.push((rel, std::fs::read(&path).ok()?));
+        }
+    }
+    Some(())
 }
 
 /// 递归复制目录。**覆盖式**写入,不复用删除 API（删目录在本机会被安全策略拦）。
@@ -733,8 +790,8 @@ mod tests {
         let cred_file = user_root.join("bili_credentials.json");
         std::fs::write(&cred_file, r#"{"SESSDATA":"secret"}"#).unwrap();
 
-        // 模拟一次全量播种(只碰这三个名字)
-        for name in [MANIFEST_FILENAME, SITECUSTOMIZE_FILENAME, "dtpatch_bili"] {
+        // 模拟一次全量播种
+        for name in SEEDED_ENTRIES {
             let from = bundle.join(name);
             let to = user_root.join(name);
             if from.is_dir() {
@@ -829,6 +886,91 @@ mod tests {
             p.effective_dir(Some("1.6.14")),
             Some(user_root.clone()),
             "新增的已验证版本必须立刻生效"
+        );
+    }
+
+    /// ★ 只改补丁包里的 `.py`，`sitecustomize.py` 与 `patch.json` 一个字节没动。
+    ///
+    /// 这是本项目真实发生过的漏洞：比对只看那两个文件，于是补丁包的更新
+    /// **永远落不到用户目录** —— 而播种日志还显示「已是最新」。
+    /// 症状是「明明发了新版补丁，用户那边行为还是老样子」。
+    #[test]
+    fn package_only_change_propagates() {
+        let res = fake_bundle("pkg-v1", "# v1\n");
+        let source = res.join("patches");
+        let user_root = std::env::temp_dir()
+            .join(format!("dt-patch-pkg-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&user_root);
+
+        Patches::seed_into(&source, &user_root, Some("1.6.13"));
+        assert_eq!(
+            std::fs::read_to_string(user_root.join(PATCH_PACKAGE_DIRNAME).join("search.py")).unwrap(),
+            "# search\n"
+        );
+
+        // 只动补丁包
+        std::fs::write(
+            source.join(PATCH_PACKAGE_DIRNAME).join("search.py"),
+            "# search v2\n",
+        )
+        .unwrap();
+
+        assert!(
+            Patches::seed_into(&source, &user_root, Some("1.6.13")).is_some(),
+            "补丁包内容变化必须触发重新播种"
+        );
+        assert_eq!(
+            std::fs::read_to_string(user_root.join(PATCH_PACKAGE_DIRNAME).join("search.py")).unwrap(),
+            "# search v2\n",
+            "新内容必须真的落到用户目录"
+        );
+    }
+
+    /// 补丁包里新增一个文件也必须算变化（不只是已有文件被改）。
+    #[test]
+    fn package_new_file_propagates() {
+        let res = fake_bundle("pkg-new", "# v1\n");
+        let source = res.join("patches");
+        let user_root = std::env::temp_dir()
+            .join(format!("dt-patch-pkgnew-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&user_root);
+
+        Patches::seed_into(&source, &user_root, Some("1.6.13"));
+        std::fs::write(
+            source.join(PATCH_PACKAGE_DIRNAME).join("extra.py"),
+            "# new module\n",
+        )
+        .unwrap();
+
+        assert!(
+            Patches::seed_into(&source, &user_root, Some("1.6.13")).is_some(),
+            "补丁包新增文件必须触发重新播种"
+        );
+        assert!(user_root.join(PATCH_PACKAGE_DIRNAME).join("extra.py").is_file());
+    }
+
+    /// ★ 目标目录里的 `__pycache__` 不得让比对永不相等。
+    ///
+    /// Python 一跑就会在补丁包下产出编译缓存。若它参与比对，结果是
+    /// **每次启动都重播种**（无害但吵，且掩盖真正的更新信号）。
+    /// 比对必须和 `copy_dir` 一样跳过它。
+    #[test]
+    fn pycache_does_not_trigger_reseed() {
+        let res = fake_bundle("pycache", "# v1\n");
+        let source = res.join("patches");
+        let user_root = std::env::temp_dir()
+            .join(format!("dt-patch-pycache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&user_root);
+
+        Patches::seed_into(&source, &user_root, Some("1.6.13"));
+        // 模拟 Python 在用户目录里跑过
+        let cache = user_root.join(PATCH_PACKAGE_DIRNAME).join("__pycache__");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("search.cpython-313.pyc"), b"\x00compiled").unwrap();
+
+        assert!(
+            Patches::seed_into(&source, &user_root, Some("1.6.13")).is_none(),
+            "只有编译缓存不同,不该重新播种"
         );
     }
 

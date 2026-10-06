@@ -1,0 +1,300 @@
+/* B 站搜索窗口样式。
+ *
+ * 设计取向：这是一个**工具窗口**，不是页面 —— 所以视觉上做两件事就够了：
+ * 让「关键词输入 + 搜索」一眼可见，让「结果列表」一眼可扫。
+ *
+ * 主题用 B 站的品牌粉 #FB7299 做强调色，其余交给系统浅色/深色
+ * （`color-scheme` + `Canvas`/`CanvasText`），跟随系统不打架。
+ * */
+
+:root {
+  color-scheme: light dark;
+  --accent: #fb7299;
+  --accent-ink: #ffffff;
+  --accent-soft: color-mix(in srgb, var(--accent) 12%, transparent);
+  --line: color-mix(in srgb, CanvasText 13%, transparent);
+  --line-strong: color-mix(in srgb, CanvasText 22%, transparent);
+  --field: color-mix(in srgb, CanvasText 5%, Canvas);
+  --hover: color-mix(in srgb, CanvasText 7%, transparent);
+  --muted: color-mix(in srgb, CanvasText 62%, transparent);
+  --radius: 10px;
+  --shadow: 0 1px 2px color-mix(in srgb, CanvasText 8%, transparent),
+            0 8px 24px color-mix(in srgb, CanvasText 6%, transparent);
+}
+
+* { box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+body {
+  margin: 0;
+  padding: 16px 18px 18px;
+  font: 14px/1.65 "Microsoft YaHei UI", "Segoe UI Variable Text", "Segoe UI",
+        system-ui, -apple-system, sans-serif;
+  background: Canvas;
+  color: CanvasText;
+  overflow-y: auto;
+  /* 软件渲染时避免整页闪烁 */
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+h1 {
+  margin: 0 0 14px;
+  font-size: 17px;
+  font-weight: 650;
+  letter-spacing: .2px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+h1::before {
+  content: "";
+  width: 4px;
+  height: 16px;
+  border-radius: 2px;
+  background: var(--accent);
+  flex: none;
+}
+
+/* ---- 输入区 ---- */
+.row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+input[type="text"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 10px 12px;
+  font-size: 14px;
+  line-height: 1.4;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  background: var(--field);
+  color: CanvasText;
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+input[type="text"]::placeholder { color: var(--muted); }
+input[type="text"]:focus {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+button {
+  font: inherit;
+  font-size: 14px;
+  font-weight: 550;
+  padding: 10px 18px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  background: var(--accent);
+  color: var(--accent-ink);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: filter .15s ease, opacity .15s ease, background .15s ease;
+}
+button:hover { filter: brightness(1.06); }
+button:active { filter: brightness(.96); }
+button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+button:disabled {
+  opacity: .5;
+  cursor: default;
+  filter: none;
+}
+
+button.ghost {
+  background: transparent;
+  color: CanvasText;
+  border-color: var(--line-strong);
+}
+button.ghost:hover { background: var(--hover); filter: none; }
+
+.pageinfo {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- 状态行 ---- */
+#status {
+  margin: 14px 0 10px;
+  min-height: 1.5em;
+  font-size: 13px;
+  color: var(--muted);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+#status:empty { margin: 12px 0 6px; }
+#status.error { color: var(--accent); }
+
+/* 状态行里的「重试」—— 是个内联小按钮，不是主按钮 */
+button.retry {
+  padding: 3px 12px;
+  font-size: 12px;
+  font-weight: 550;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent);
+  border-color: var(--accent);
+}
+button.retry:hover { background: var(--accent-soft); filter: none; }
+
+/* ---- 结果列表 ---- */
+#list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.item {
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 10px;
+  border: 1px solid transparent;
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: background .12s ease, border-color .12s ease;
+}
+.item:hover {
+  background: var(--hover);
+  border-color: var(--line);
+}
+.item:active { transform: translateY(1px); }
+.item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+/* 缩略图是**容器**（外层 div），图在里面铺满 —— 这样封面加载失败时
+   容器还在，布局不会塌，也不会出现「半张图」。 */
+.thumb {
+  width: 112px;
+  height: 63px;
+  border-radius: 8px;
+  flex: none;
+  overflow: hidden;
+  background: var(--field);
+  border: 1px solid var(--line);
+}
+.thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.thumb.missing {
+  background:
+    linear-gradient(135deg,
+      color-mix(in srgb, CanvasText 6%, transparent),
+      color-mix(in srgb, CanvasText 3%, transparent));
+}
+
+.meta {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  flex: 1 1 auto;
+}
+
+.title {
+  font-size: 13.5px;
+  font-weight: 550;
+  line-height: 1.5;
+  /* 标题最多两行，超了省略 —— 否则长标题会把列表撑乱 */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+/* 简介一行带过：它只是用来区分同名视频的，不该抢标题的戏 */
+.desc {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--muted);
+  display: -webkit-box;
+  -webkit-line-clamp: 1;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-word;
+}
+
+.sub {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.sub span { display: inline-flex; align-items: center; gap: 4px; }
+.sub .author {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sub .dur,
+.sub .play {
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+
+.empty {
+  padding: 52px 16px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--muted);
+}
+.empty b { color: CanvasText; font-weight: 600; }
+
+.hint {
+  margin-top: 18px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  font-size: 12px;
+  line-height: 1.8;
+  color: var(--muted);
+}
+
+kbd {
+  padding: 1px 6px;
+  border: 1px solid var(--line-strong);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  font-size: 11px;
+  font-family: inherit;
+  background: var(--field);
+  color: CanvasText;
+}
+
+/* 滚动条：别用默认的，太重 */
+body::-webkit-scrollbar { width: 10px; }
+body::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+  border-radius: 5px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+body::-webkit-scrollbar-thumb:hover {
+  background: var(--muted);
+  background-clip: content-box;
+}
+body::-webkit-scrollbar-track { background: transparent; }
+
+/* 窄窗口时缩缩缩略图 */
+@media (max-width: 520px) {
+  .thumb { width: 88px; height: 50px; }
+  body { padding: 14px; }
+}
