@@ -1,6 +1,6 @@
 [package]
 name = "DeepTutorDesktopWin"
-version = "0.2.10"
+version = "0.2.11"
 description = "Native Windows shell for HKUDS/DeepTutor"
 authors = ["DeepTutor Contributors"]
 edition = "2021"
