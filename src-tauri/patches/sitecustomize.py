@@ -26,7 +26,8 @@ from __future__ import annotations
 import sys
 import traceback
 
-_TARGET = "deeptutor.video_learning.service"
+_SERVICE = "deeptutor.video_learning.service"
+_ROUTER = "deeptutor.api.routers.video_learning"
 
 
 def _log(msg: str) -> None:
@@ -43,7 +44,7 @@ class _VideoLearningPatch:
         return None
 
     def find_spec(self, fullname, path=None, target=None):
-        if fullname != _TARGET:
+        if fullname not in (_SERVICE, _ROUTER):
             return None
         import importlib.util
 
@@ -65,11 +66,18 @@ class _VideoLearningPatch:
         def exec_module(module):
             original_exec(module)
             try:
-                from dtpatch_bili import apply_patch
+                if fullname == _SERVICE:
+                    from dtpatch_bili import apply_patch
 
-                apply_patch(module)
+                    apply_patch(module)
+                else:
+                    from dtpatch_bili import router as bili_router
+
+                    # ★ 必须在 include_router 之前完成 —— router 模块 import 完
+                    # 就立刻注册,那时app 还没遍历它的 routes。
+                    bili_router.install(module)
             except Exception:  # noqa: BLE001 - never break the backend
-                _log("注入失败,沉浸式观看的 B 站支持本次不可用:")
+                _log(f"注入 {fullname} 失败，相关功能本次不可用:")
                 traceback.print_exc(file=sys.stderr)
 
         spec.loader.exec_module = exec_module

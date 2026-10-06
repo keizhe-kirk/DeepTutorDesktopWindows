@@ -63,10 +63,19 @@ pub struct PatchState {
     /// 是否启用。`false` / 缺失 = 不打补丁。
     #[serde(default)]
     pub enabled: bool,
+    /// 状态是否已初始化过。
+    ///
+    /// ★ 必须显式区分「从没播种过」与「用户主动停用过」：
+    /// 两者在 [`enabled`] 上都是 `false`，但前者应当在播种时自动启用，
+    /// 后者必须尊重用户选择。没有这个字段的话，停用功能在下次启动
+    /// 播种时会被悄悄推翻 —— 而用户不会知道。
+    #[serde(default)]
+    pub initialized: bool,
     /// 这份补丁是为哪个内置版写的。
     ///
-    /// 内置版一旦不同,补丁自动停用 —— 见 [`Patches::is_applicable`]。
-    /// 上游一旦真的实现了 bilibili provider,用户就该用回内置版。
+    /// 内置版一旦不同、而补丁内容又没跟着更新，补丁自动停用 ——
+    /// 见 [`Patches::is_applicable`]。
+    /// 上游一旦真的实现了 bilibili provider，用户就该用回内置版。
     #[serde(default)]
     pub for_bundled: Option<String>,
     /// 补丁标识(当前只有 `"bilibili"`)。
@@ -202,10 +211,44 @@ impl Patches {
     /// 同一套策略。
     pub fn seed_from_bundle(resource_dir: Option<&Path>, bundled: Option<&str>) -> Option<PathBuf> {
         let source = Self::find_bundled_patches(resource_dir)?;
-        let target_root = Self::detect(None).root;
+        // 目标目录必须与 `effective_dir` 用同一套定位规则(都尊重
+        // DEEPTUTOR_HOME),否则自检改了 HOME 会两边指向不同地方。
+        let target_root = Self::detect(Some(super::runtime::effective_home()))
+            .root
+            .to_path_buf();
+        Self::seed_into(&source, &target_root, bundled)
+    }
 
-        // Already seeded from this build -> nothing to do. Compare the hook's
-        // content so a shell update that ships a new patch still propagates.
+    /// 播种本体。目标目录显式传入,便于测试隔离(不碰真实用户目录)。
+    ///
+    /// 返回 `Some(root)` 表示本次真的写了东西(可用于打日志),
+    /// `None` 表示已是最新、无需改动。
+    fn seed_into(source: &Path, target_root: &Path, bundled: Option<&str>) -> Option<PathBuf> {
+        // ---- 状态:先确保已初始化,再谈内容 ----
+        //
+        // 顺序很重要。★ 播种必须写 `enabled: true`,否则 `effective_dir` 的
+        // `is_enabled()` 永远为假 —— 文件都在、钩子也在,却一份补丁都不打,
+        // 而且没有任何症状(后端正常启动,只是 B 站链接照旧报不支持),
+        // 是最难查的一类故障。
+        //
+        // 同时只在**首次**播种时启用:`initialized` 之后一律保留用户的选择,
+        // 否则「停用补丁」会被下次启动的播种悄悄推翻。
+        let mut state = self_state(target_root);
+        let mut state_dirty = false;
+        if !state.initialized {
+            state.initialized = true;
+            state.enabled = true;
+            state.id = Some("bilibili".to_string());
+            state.enabled_at = Some(chrono::Utc::now().to_rfc3339());
+            state_dirty = true;
+        }
+        if state.for_bundled.is_none() {
+            state.for_bundled = bundled.map(str::to_string);
+            state_dirty = true;
+        }
+
+        // 已播种过同一份内容 -> 无需拷贝。但状态可能还没落盘(例如上一次写盘失败),
+        // 所以这里仍要把状态补写一次再收工。
         let installed_hook = target_root.join(SITECUSTOMIZE_FILENAME);
         let same = match (
             std::fs::read(source.join(SITECUSTOMIZE_FILENAME)),
@@ -215,12 +258,20 @@ impl Patches {
             _ => false,
         };
         if same {
+            if state_dirty {
+                let _ = write_state_at(target_root, &state);
+            }
             return None;
         }
 
         let copy_result = (|| -> Result<()> {
-            std::fs::create_dir_all(&target_root)
+            std::fs::create_dir_all(target_root)
                 .with_context(|| format!("创建补丁目录失败: {}", target_root.display()))?;
+            // ★ 只拷这三个名字:sitecustomize + 补丁包。
+            // 绝不能整目录搬 —— 用户目录里还放着 `bili_credentials.json`,
+            // 那是扫码产生的凭据,覆盖式播种会把它连同旧内容一起抹掉。
+            // 新增补丁文件时必须同步改这里(测试 `credentials_survive_reseeding`
+            // 只钉住了「凭据不被碰」,不钉住「该拷的都拷了」)。
             for name in ["sitecustomize.py", "dtpatch_bili"] {
                 let from = source.join(name);
                 let to = target_root.join(name);
@@ -240,16 +291,14 @@ impl Patches {
             return None;
         }
 
-        // Stamp the baseline so the applicability check has something to
-        // compare against. An unknown bundled version stays unset, which
-        // `is_applicable` treats as permissive.
-        let mut state = self_state(&target_root);
-        if state.for_bundled.is_none() {
-            state.for_bundled = bundled.map(str::to_string);
-        }
-        let _ = write_state_at(&target_root, &state);
-        log::info!("已播种本地补丁: {}", target_root.display());
-        Some(target_root)
+        let _ = write_state_at(target_root, &state);
+        log::info!(
+            "已播种本地补丁(id={}, for_bundled={}): {}",
+            state.id.as_deref().unwrap_or("-"),
+            state.for_bundled.as_deref().unwrap_or("-"),
+            target_root.display()
+        );
+        Some(target_root.to_path_buf())
     }
 
     /// 补丁内容在安装目录里的只读源。
@@ -357,6 +406,7 @@ mod tests {
         let p = tmp_patches("same");
         install_hook(&p);
         p.write_state(&PatchState {
+            initialized: true,
             enabled: true,
             for_bundled: Some("1.6.12".into()),
             id: Some("bilibili".into()),
@@ -376,6 +426,7 @@ mod tests {
         let p = tmp_patches("drift");
         install_hook(&p);
         p.write_state(&PatchState {
+            initialized: true,
             enabled: true,
             for_bundled: Some("1.6.12".into()),
             id: Some("bilibili".into()),
@@ -392,6 +443,7 @@ mod tests {
         let p = tmp_patches("nohook");
         // 状态启用但没放 sitecustomize.py -> 不注入,别污染 sys.path
         p.write_state(&PatchState {
+            initialized: true,
             enabled: true,
             for_bundled: Some("1.6.12".into()),
             id: Some("bilibili".into()),
@@ -406,6 +458,7 @@ mod tests {
         let p = tmp_patches("nobundled");
         install_hook(&p);
         p.write_state(&PatchState {
+            initialized: true,
             enabled: true,
             for_bundled: Some("1.6.12".into()),
             id: Some("bilibili".into()),
@@ -421,6 +474,7 @@ mod tests {
         let p = tmp_patches("noforbundled");
         install_hook(&p);
         p.write_state(&PatchState {
+            initialized: true,
             enabled: true,
             for_bundled: None,
             id: Some("bilibili".into()),
@@ -445,6 +499,7 @@ mod tests {
         let p = tmp_patches("deact");
         install_hook(&p);
         p.write_state(&PatchState {
+            initialized: true,
             enabled: true,
             for_bundled: Some("1.6.12".into()),
             id: Some("bilibili".into()),
@@ -548,5 +603,85 @@ mod tests {
         assert!(cred_file.is_file(), "凭据文件必须原样保留");
         let text = std::fs::read_to_string(&cred_file).unwrap();
         assert!(text.contains("secret"), "凭据内容必须未被覆盖");
+    }
+
+    /// ★ 播种后必须真的生效。
+    ///
+    /// 这是本文件最要紧的不变量:`effective_dir` 要求 `enabled`,而播种如果
+    /// 不写它,就会出现「文件都在、后端正常起、B 站就是不支持」—— 且没有任何
+    /// 报错提示。之前正是踩了这个坑。
+    #[test]
+    fn seeding_enables_the_patch() {
+        let res = fake_bundle("enable", "# v1\n");
+        let source = res.join("patches");
+        let user_root = std::env::temp_dir()
+            .join(format!("dt-patch-enable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&user_root);
+
+        assert!(Patches::seed_into(&source, &user_root, Some("1.6.12")).is_some());
+
+        let p = Patches { root: user_root.clone() };
+        let state = p.state();
+        assert!(state.initialized, "状态必须标记为已初始化");
+        assert!(state.is_enabled(), "首次播种必须自动启用补丁");
+        assert_eq!(state.for_bundled.as_deref(), Some("1.6.12"));
+        assert!(user_root.join(SITECUSTOMIZE_FILENAME).is_file());
+        assert!(user_root.join("dtpatch_bili").is_dir());
+        assert_eq!(
+            p.effective_dir(Some("1.6.12")),
+            Some(user_root.clone()),
+            "播种完必须立刻可注入 PYTHONPATH"
+        );
+    }
+
+    /// 停用之后,后续播种不得偷偷把用户的选择推翻。
+    #[test]
+    fn reseeding_respects_a_user_disable() {
+        let res = fake_bundle("respect", "# v1\n");
+        let source = res.join("patches");
+        let user_root = std::env::temp_dir()
+            .join(format!("dt-patch-respect-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&user_root);
+
+        Patches::seed_into(&source, &user_root, Some("1.6.12"));
+        let p = Patches { root: user_root.clone() };
+        p.deactivate().unwrap();
+        assert!(!p.state().is_enabled());
+
+        // 内容没变 -> 不该拷贝,但状态也必须保持停用。
+        assert!(Patches::seed_into(&source, &user_root, Some("1.6.12")).is_none());
+        assert!(
+            !p.state().is_enabled(),
+            "用户停用后,播种不得重新启用"
+        );
+        assert_eq!(p.effective_dir(Some("1.6.12")), None);
+    }
+
+    /// 停用 + 壳升级带来新补丁内容:内容要同步,但仍尊重用户的停用。
+    #[test]
+    fn update_propagates_content_but_keeps_disabled() {
+        let res = fake_bundle("update-v1", "# v1\n");
+        let source = res.join("patches");
+        let user_root = std::env::temp_dir()
+            .join(format!("dt-patch-update-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&user_root);
+
+        Patches::seed_into(&source, &user_root, Some("1.6.12"));
+        let p = Patches { root: user_root.clone() };
+        p.deactivate().unwrap();
+
+        // 模拟新壳版本带了 v2 补丁。
+        std::fs::write(source.join(SITECUSTOMIZE_FILENAME), "# v2\n").unwrap();
+        assert!(
+            Patches::seed_into(&source, &user_root, Some("1.6.13")).is_some(),
+            "内容变了就该重新拷贝"
+        );
+
+        let text = std::fs::read_to_string(user_root.join(SITECUSTOMIZE_FILENAME)).unwrap();
+        assert_eq!(text, "# v2\n", "新补丁内容必须落到用户目录");
+        assert!(
+            !p.state().is_enabled(),
+            "内容更新不等于用户同意启用"
+        );
     }
 }

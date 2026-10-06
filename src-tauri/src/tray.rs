@@ -68,6 +68,10 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
             &MenuItem::with_id(app, "backend-update", "检查后端更新…", true, None::<&str>)?,
             &MenuItem::with_id(app, "backend-rollback", "回退到内置后端", true, None::<&str>)?,
             &PredefinedMenuItem::separator(app)?,
+            // 设置组:B 站字幕需要登录态,没登录态时「边看边学」只剩播放。
+            &MenuItem::with_id(app, "bili-login", "登录哔哩哔哩（获取字幕）…", true, None::<&str>)?,
+            &MenuItem::with_id(app, "bili-logout", "清除哔哩哔哩登录", true, None::<&str>)?,
+            &PredefinedMenuItem::separator(app)?,
             // 不用 PredefinedMenuItem::quit:它直接退出,不给我们清理后端的机会。
             // 自定义项可以显式杀进程树再退。
             &MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?,
@@ -118,6 +122,18 @@ pub fn setup(app: &AppHandle) -> tauri::Result<()> {
                 let handle = app.clone();
                 tauri::async_runtime::spawn(async move {
                     run_backend_rollback_flow(handle).await;
+                });
+            }
+            "bili-login" => {
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    run_bilibili_login_flow(handle).await;
+                });
+            }
+            "bili-logout" => {
+                let handle = app.clone();
+                tauri::async_runtime::spawn(async move {
+                    run_bilibili_logout_flow(handle).await;
                 });
             }
             "quit" => {
@@ -383,6 +399,99 @@ async fn run_backend_rollback_flow(app: AppHandle) {
         Err(e) => info_dialog(&app, "回退失败", &e).await,
     }
     set_tooltip(&app, TOOLTIP_IDLE);
+}
+
+// 登录流程防重入:扫码要几分钟,期间连点会起多个浏览器实例。
+static BILI_LOGIN_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// 托盘「登录哔哩哔哩」的流程。
+///
+/// B 站的字幕/章节接口需要登录态（实测多数教学视频`need_login_subtitle=true`），
+/// 没登录态时沉浸式观看只剩播放、没有字幕可跟读。
+///
+/// 这里用系统浏览器扫码，**不接触账号密码**：凭据只落
+/// `%LOCALAPPDATA%\DeepTutor\patches\bili_credentials.json`，且只保留
+/// `SESSDATA` / `buvid3` 两项。
+async fn run_bilibili_login_flow(app: AppHandle) {
+    use crate::backend::bilibili;
+
+    if BILI_LOGIN_RUNNING.swap(true, Ordering::SeqCst) {
+        info_dialog(&app, "哔哩哔哩登录", "已有一个登录流程在进行中，请先完成或等待超时。").await;
+        return;
+    }
+
+    if let Err(e) = bilibili::patch_ready_check(&app) {
+        info_dialog(&app, "哔哩哔哩登录", &e).await;
+        BILI_LOGIN_RUNNING.store(false, Ordering::SeqCst);
+        return;
+    }
+
+    let result = bilibili::login(&app, |notice| set_tooltip(&app, notice)).await;
+    set_tooltip(&app, TOOLTIP_IDLE);
+    BILI_LOGIN_RUNNING.store(false, Ordering::SeqCst);
+
+    match result {
+        Ok(outcome) if outcome.ok => {
+            //登录后立刻校验一次：SESSDATA 写下了不等于服务端认。
+            let detail = match bilibili::status(&app).await {
+                Ok(s) if s.valid == "true" => {
+                    let who = if s.detail.is_empty() { String::new() } else { format!("（{}）", s.detail) };
+                    format!("已保存登录态{who}。\n\n现在把B 站链接粘进沉浸式观看，字幕与章节会随视频一起加载。")
+                }
+                Ok(s) => format!(
+                    "登录态已保存，但 B 站暂未接受它：{}\n\n可以稍后重试，或换一个账号再试。",
+                    s.detail
+                ),
+                Err(_) => "已保存登录态。".to_string(),
+            };
+            info_dialog(&app, "哔哩哔哩登录成功", &detail).await;
+        }
+        Ok(_) => {
+            info_dialog(
+                &app,
+                "未完成登录",
+                "没有取到登录态。\n\n请在打开的浏览器里完成扫码后重试；如果浏览器没有自动打开，\
+                 也可以手动打开 https://passport.bilibili.com/login 登录后，\
+                 再回到这里点一次「登录哔哩哔哩」。",
+            )
+            .await;
+        }
+        Err(e) => info_dialog(&app, "哔哩哔哩登录失败", &e).await,
+    }
+}
+
+/// 托盘「清除哔哩哔哩登录」的流程。
+async fn run_bilibili_logout_flow(app: AppHandle) {
+    use crate::backend::bilibili;
+
+    let current = match bilibili::status(&app).await {
+        Ok(s) => s,
+        Err(e) => {
+            info_dialog(&app, "清除哔哩哔哩登录", &e).await;
+            return;
+        }
+    };
+
+    if current.logged_in != "true" {
+        info_dialog(&app, "清除哔哩哔哩登录", "当前没有保存任何哔哩哔哩登录态。").await;
+        return;
+    }
+
+    let msg = match current.detail.as_str() {
+        "" => "将删除本机保存的哔哩哔哩登录态。\n\n删除后沉浸式观看将只剩播放、没有字幕。".to_string(),
+        d => format!(
+            "将删除本机保存的哔哩哔哩登录态（{d}）。\n\n删除后沉浸式观看将只剩播放、没有字幕。"
+        ),
+    };
+    if !confirm_dialog_with(&app, "清除哔哩哔哩登录", &msg, "清除", "取消").await {
+        return;
+    }
+
+    match bilibili::clear(&app).await {
+        Ok(o) if o.ok => info_dialog(&app, "已清除", "本机保存的哔哩哔哩登录态已删除。").await,
+        Ok(_) => info_dialog(&app, "清除失败", "没有找到可清除的登录态（可能已经清过了）。").await,
+        Err(e) => info_dialog(&app, "清除失败", &e).await,
+    }
 }
 
 /// 提示型对话框(仅确定按钮)。
