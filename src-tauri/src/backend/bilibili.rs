@@ -223,7 +223,9 @@ pub fn patch_ready_check(app: &AppHandle) -> Result<(), String> {
     let Some(runner) = app.try_state::<std::sync::Arc<super::runner::Runner>>() else {
         return Err("后端管理器尚未就绪，请稍后重试。".into());
     };
-    let version = runner.bundled().deeptutor_version();
+    // ★ 必须与 runner.rs 的注入判据同源（生效版：叠加层优先），否则菜单会说
+    // 「已就绪」而实际没注入 —— 用户点了才发现，白跑一趟浏览器。
+    let version = super::runner::effective_deeptutor_version(&runner.bundled());
     if Patches::detect(Some(super::runtime::effective_home()))
         .effective_dir(version.as_deref())
         .is_some()

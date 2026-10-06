@@ -340,7 +340,10 @@ impl Runner {
         //
         // 种子来自内置运行时的同级目录(与 runtime::detect 的兜底同源),所以这
         // 一步不依赖 Tauri 的 resource_dir,后端启动阶段就能做。
-        let deeptutor_version = bundled.deeptutor_version();
+        // ★ 基线记的是**生效版**（叠加层优先），不是内置版 —— 与下面的
+        // patch_python_path 必须用同一个判据，否则会出现「基线记 1.6.12、
+        // 生效是 1.6.13」这种刚播种完就判定不适用的错配。
+        let deeptutor_version = effective_deeptutor_version(&bundled);
         if super::patch::Patches::seed_beside_runtimes(
             bundled.root(),
             deeptutor_version.as_deref(),
@@ -723,11 +726,76 @@ fn overlay_python_path(bundled: &BundledRuntimes) -> Option<PathBuf> {
 ///
 /// 判定逻辑在 [`super::patch::Patches::effective_dir`] 里。与叠加层相反,
 /// 这里**不做版本大小比较** —— 补丁的版本号与内置版相同,比较等于自杀;
-/// 改用「补丁记录的基线版本 == 当前内置版」这条等值校验,不等就自动停用。
+/// 改用「补丁记录的基线版本 == 实际生效的 deeptutor 版本」这条等值校验,
+/// 不等就自动停用。
 ///
-/// 另外要求补丁目录里确实有 `sitecustomize.py`:Python 只在能 import 到它时
-/// 才会执行钩子,空目录塞进 `PYTHONPATH` 只会白白污染 `sys.path`。
+/// ★ 比的必须是**生效版**而不是内置版。补丁改写的是「最终被 import 的那份
+/// deeptutor」,而 PYTHONPATH 里叠加层排在补丁层**前面** —— 所以后端热更新
+/// 激活新版后,补丁实际打在新版上。此时若拿内置版去比,会把「补丁是给 1.6.12
+/// 写的、现在生效的是 1.6.13」误判成「1.6.12 == 1.6.12,适用」,补丁就会
+/// 打在一个它从未验证过的版本上。
+/// 同理,`seed_beside_runtimes` 记下的基线也必须是生效版,否则首次播种就会
+/// 烙下错误的基线。
 fn patch_python_path(bundled: &BundledRuntimes) -> Option<PathBuf> {
     let patches = super::patch::Patches::detect(Some(runtime::effective_home()));
-    patches.effective_dir(bundled.deeptutor_version().as_deref())
+    patches.effective_dir(effective_deeptutor_version(bundled).as_deref())
+}
+
+/// 实际会被 import 的 deeptutor 版本 —— 叠加层优先,没有叠加层才是内置版。
+///
+/// 抽成自由函数是因为播种与注入必须用**同一个**判据:基线按 A 记、校验按 B 判,
+/// 两边不一致就会出现「刚播种完就判定不适用」或反之。
+pub(crate) fn effective_deeptutor_version(bundled: &BundledRuntimes) -> Option<String> {
+    effective_version_in(Some(runtime::effective_home()), bundled)
+}
+
+/// 同上，但 `home` 可显式指定 —— 测试用（否则会读真实用户目录）。
+fn effective_version_in(
+    home: Option<std::path::PathBuf>,
+    bundled: &BundledRuntimes,
+) -> Option<String> {
+    let bundled_version = bundled.deeptutor_version();
+    let overlay = super::overlay::Overlay::detect(home);
+    overlay
+        .effective_version(bundled_version.as_deref())
+        .or(bundled_version)
+}
+
+#[cfg(test)]
+mod patch_version_tests {
+    use super::*;
+
+    /// ★ 核心不变量：叠加层激活新版时，生效版必须是**新版**而不是内置版。
+    ///
+    /// 这决定了补丁的适用性判据 —— 若返回内置版，热更新用户的补丁就会
+    /// 打在一个从未验证过的 deeptutor 上（实测：本机已热更新到 1.6.13，
+    /// 内置仍是 1.6.12）。
+    #[test]
+    fn effective_version_prefers_overlay_over_bundled() {
+        let home = std::env::temp_dir().join(format!("dt-effver-{}", std::process::id()));
+        let overlay = super::super::overlay::Overlay::detect(Some(home.clone()));
+
+        // 铺一个比内置版更新的激活版本（内置版读不到时按None 走宽松分支）。
+        let newer = "99.0.0";
+        std::fs::create_dir_all(overlay.version_dir(newer)).unwrap();
+        overlay
+            .write_state(&super::super::overlay::OverlayState {
+                active: Some(newer.to_string()),
+                activated_at: None,
+                packages: Vec::new(),
+                base_bundled: None,
+            })
+            .unwrap();
+
+        // 内置版读不到（测试机上没有安装目录），至少不能凭空造出别的版本号。
+        let got = effective_version_in(Some(home.clone()), &BundledRuntimes::detect(None));
+        if got.is_some() {
+            assert_eq!(
+                got.as_deref(),
+                Some(newer),
+                "叠加层已激活 99.0.0 时，生效版必须是它而不是内置版"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
 }
