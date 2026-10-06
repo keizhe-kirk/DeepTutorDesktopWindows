@@ -215,7 +215,7 @@ where
     }
 }
 
-/// 补丁是否可用（没播种 / 没启用时不显示登录入口）。
+/// 补丁是否可用（没播种 / 没启用 / 版本不匹配时不显示登录入口）。
 ///
 /// 返回 `Err(msg)` 而非 bool，是为了让调用方能把「为什么不支持」讲清楚 ——
 /// 用户看到一句「本地补丁尚未就位」比看到一个灰掉的菜单项有用得多。
@@ -226,17 +226,30 @@ pub fn patch_ready_check(app: &AppHandle) -> Result<(), String> {
     // ★ 必须与 runner.rs 的注入判据同源（生效版：叠加层优先），否则菜单会说
     // 「已就绪」而实际没注入 —— 用户点了才发现，白跑一趟浏览器。
     let version = super::runner::effective_deeptutor_version(&runner.bundled());
-    if Patches::detect(Some(super::runtime::effective_home()))
-        .effective_dir(version.as_deref())
-        .is_some()
-    {
+    let patches = Patches::detect(Some(super::runtime::effective_home()));
+    let effective = version.as_deref();
+    if patches.effective_dir(effective).is_some() {
         return Ok(());
     }
-    Err(
-        "哔哩哔哩支持尚未启用（本地补丁未就绪）。\n\n请完全退出 DeepTutor 后重新启动一次，\
-         让应用完成首次播种。"
-            .into(),
-    )
+
+    // ★ 报错必须说清**真实原因**。这里曾经只有一句「请完全退出后重新启动」——
+    // 而版本判据不匹配时重启再多次也没用，用户会被这句话无限误导下去。
+    // （真机踩过：生效版 1.6.13、旧基线 1.6.12，菜单报未就绪。）
+    let Some(reason) = patches.inapplicable_reason(effective) else {
+        // 判据放行但没注入 → 只剩钩子文件缺失这一种可能。
+        return Err(
+            "哔哩哔哩支持尚未启用（本地补丁未就绪）。\n\n\
+             请完全退出 DeepTutor 后重新启动一次，让应用完成首次播种。"
+                .into(),
+        );
+    };
+    let hint = match reason.as_str() {
+        "补丁未启用" => "请完全退出 DeepTutor 后重新启动一次，让应用完成首次播种。",
+        _ => "请更新 DeepTutor 桌面端到最新版本（补丁需与该版本一同发布）。",
+    };
+    Err(format!(
+        "哔哩哔哩支持尚未启用。\n\n原因：{reason}\n\n{hint}"
+    ))
 }
 
 /// 补丁目录（供文案展示）。

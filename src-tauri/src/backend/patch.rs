@@ -29,6 +29,7 @@
 //! ```text
 //! %LOCALAPPDATA%\DeepTutor\patches\
 //!   state.json          当前补丁状态(见 PatchState)
+//!   patch.json          补丁清单(见 PatchManifest)
 //!   sitecustomize.py    import 钩子(由补丁内容提供)
 //!   dtpatch_bili\       补丁实现包
 //!   bili_credentials.json  B 站登录凭据(用户扫码产生;绝不入库)
@@ -41,9 +42,15 @@
 //!
 //! # 失效策略：宁可不打,不可打坏
 //!
-//! 补丁记录它是为哪个内置版写的(`for_bundled`)。桌面壳升级让内置版变了之后,
-//! 补丁**自动停用**并记一行日志,而不是硬打上去把后端搞崩。
-//! 停用只需改 `state.json`,与 [`Overlay::deactivate`] 一样可靠。
+//! 补丁通过 [`PatchManifest::verified_deeptutor`] 声明**自己在哪些 deeptutor
+//! 版本上验证过**。生效版不在清单里就不打,只记一行日志。
+//!
+//! ★ 清单必须**随补丁一起发布**,不能靠运行时 stamping。之前这里记的是
+//! 「播种那一刻碰巧在跑的版本」(`for_bundled`,由 [`Patches::seed_into`] 写入
+//! `state.json`),于是后端热更新一激活新版,基线就永久陈旧 —— 而且
+//! `if state.for_bundled.is_none()` 意味着它**再也不会被刷新**。用户表现是
+//! 「文件都在、后端正常起、菜单却报补丁未就绪,而且重启多少次都没用」。
+//! 那是运行期状态被当成静态契约用,必然烂尾。
 
 use std::path::{Path, PathBuf};
 
@@ -54,8 +61,28 @@ use serde::{Deserialize, Serialize};
 const PATCH_DIRNAME: &str = "patches";
 /// 状态文件名。
 const STATE_FILENAME: &str = "state.json";
+/// 补丁清单文件名。**随补丁一起发布**,声明这份补丁验证过哪些 deeptutor 版本。
+const MANIFEST_FILENAME: &str = "patch.json";
 /// 启动钩子文件名 —— Python 会在启动时自动 import 它。
 pub const SITECUSTOMIZE_FILENAME: &str = "sitecustomize.py";
+
+/// 补丁清单(`patch.json`)。
+///
+/// ★ 这是「补丁支持哪些 deeptutor 版本」的**唯一真相来源**,随补丁内容一起
+/// 从安装目录播种过来。它必须由**补丁作者**在发版时写死,而不是运行时推测:
+/// 补丁改的是 deeptutor 内部模块的函数引用,能不能用只有写补丁的人知道。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PatchManifest {
+    /// 补丁标识(当前只有 `"bilibili"`)。
+    #[serde(default)]
+    pub id: String,
+    /// 验证过的 deeptutor 版本号。
+    ///
+    /// 比对时按字符串精确匹配(与旧的等值校验同口径)。**空清单 = 不拦任何
+    /// 版本**,补丁一律打上去 —— 与叠加层「读不到就放行」同一取舍。
+    #[serde(default)]
+    pub verified_deeptutor: Vec<String>,
+}
 
 /// 补丁的持久状态。存 `state.json`。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -71,11 +98,16 @@ pub struct PatchState {
     /// 播种时会被悄悄推翻 —— 而用户不会知道。
     #[serde(default)]
     pub initialized: bool,
-    /// 这份补丁是为哪个内置版写的。
+    /// 这份补丁播种时,生效的 deeptutor 版本是多少。
     ///
-    /// 内置版一旦不同、而补丁内容又没跟着更新，补丁自动停用 ——
-    /// 见 [`Patches::is_applicable`]。
-    /// 上游一旦真的实现了 bilibili provider，用户就该用回内置版。
+    /// ★ **纯诊断信息,不参与任何判定。**
+    ///
+    /// 它曾经是适用性判据的基线,但那是错的:播种发生的那一刻"碰巧在跑什么
+    /// 版本"与"这份补丁代码在什么版本上验证过"是两件事。后端热更新一激活
+    /// 新版,这个字段就永久陈旧,而它又只在 `None` 时才被写 —— 于是补丁再也
+    /// 不会生效,用户重启多少次都没用。判定已改由 [`PatchManifest`] 承担。
+    ///
+    /// 保留它只是为了排查时能一眼看出「播种那一刻是什么环境」。
     #[serde(default)]
     pub for_bundled: Option<String>,
     /// 补丁标识(当前只有 `"bilibili"`)。
@@ -149,38 +181,74 @@ impl Patches {
         Ok(())
     }
 
-    /// 这份补丁对当前内置版**是否适用**。
+    /// 读补丁清单。文件不存在 / 解析失败 / 内容为空 → `None`(视为不拦版本)。
+    pub fn manifest(&self) -> Option<PatchManifest> {
+        let text = std::fs::read_to_string(self.root.join(MANIFEST_FILENAME)).ok()?;
+        match serde_json::from_str::<PatchManifest>(&text) {
+            Ok(m) if !m.verified_deeptutor.is_empty() => Some(m),
+            Ok(_) => None,
+            Err(e) => {
+                log::warn!(
+                    "补丁清单解析失败,本次不拦版本: {e}({})",
+                    self.root.join(MANIFEST_FILENAME).display()
+                );
+                None
+            }
+        }
+    }
+
+    /// 这份补丁对当前**生效版** deeptutor 是否适用。
     ///
-    /// -补丁没启用 → 不适用(不算错误)。
-    /// - 没记 `for_bundled`(老状态/手改)→ 适用,交给 Python 侧兜底。
-    /// - 内置版与记录一致 → 适用。
-    /// - 内置版已变→ **不适用**,补丁自动停用。
+    /// - 补丁没启用 → 不适用(不算错误)。
+    /// - 没有清单(老补丁 / 读不到)→ 适用,交给 Python 侧兜底。
+    /// - 生效版在 [`PatchManifest::verified_deeptutor`] 里 → 适用。
+    /// - 不在 → **不适用**,补丁自动停用并记一行日志。
     ///
-    /// `bundled` 传 `None`(读不到内置版)时跳过校验,与叠加层同一取舍。
-    pub fn is_applicable(&self, bundled: Option<&str>) -> bool {
+    /// `effective` 传 `None`(读不到生效版)时跳过校验,与叠加层同一取舍。
+    ///
+    /// ★ 收 `None` 的语义是「不知道」而不是「任何版本」,所以这里不能反过来说
+    /// 「清单存在就必须命中」—— 读不到版本时放行,与叠加层保持一致。
+    pub fn is_applicable(&self, effective: Option<&str>) -> bool {
+        self.inapplicable_reason(effective).is_none()
+    }
+
+    /// [`Patches::is_applicable`] 的可诊断版本:不适用时给出人话原因。
+    ///
+    /// 单独抽出来是因为「为什么 B 站不可用」必须有答案 —— 补丁静默失效过一次,
+    /// 现象是「后端正常起、菜单报未就绪」,没有任何线索指向真实原因。
+    pub fn inapplicable_reason(&self, effective: Option<&str>) -> Option<String> {
         let state = self.state();
         if !state.is_enabled() {
-            return false;
+            return Some("补丁未启用".to_string());
         }
-        let (Some(for_bundled), Some(bundled)) = (state.for_bundled.as_deref(), bundled) else {
-            return true;
+        let Some(manifest) = self.manifest() else {
+            // 没有清单 -> 不拦。与叠加层「读不到就放行」同一取舍。
+            return None;
         };
-        if for_bundled == bundled {
-            return true;
+        let Some(effective) = effective else {
+            return None;
+        };
+        if manifest.verified_deeptutor.iter().any(|v| v == effective) {
+            return None;
         }
-        log::info!(
-            "补丁 {} 是为内置版 {for_bundled} 写的,当前内置版是 {bundled},自动停用补丁",
-            state.id.as_deref().unwrap_or("(未命名)")
-        );
-        false
+        Some(format!(
+            "补丁 {} 验证过的 deeptutor 版本为 {:?},当前生效的是 {}",
+            if manifest.id.is_empty() { "(未命名)" } else { &manifest.id },
+            manifest.verified_deeptutor,
+            effective
+        ))
     }
 
     /// 补丁生效时要前置进 `PYTHONPATH` 的目录。
     ///
     /// 除了目录本身存在,还必须真的有 `sitecustomize.py` —— 否则 Python 不会
     /// 加载任何东西,把一个空目录塞进 `PYTHONPATH` 只会污染 `sys.path`。
-    pub fn effective_dir(&self, bundled: Option<&str>) -> Option<PathBuf> {
-        if !self.is_applicable(bundled) {
+    pub fn effective_dir(&self, effective: Option<&str>) -> Option<PathBuf> {
+        if !self.is_applicable(effective) {
+            log::info!(
+                "本地补丁未生效: {}",
+                self.inapplicable_reason(effective).unwrap_or_default()
+            );
             return None;
         }
         let hook = self.root.join(SITECUSTOMIZE_FILENAME);
@@ -247,17 +315,26 @@ impl Patches {
             state_dirty = true;
         }
 
-        // 已播种过同一份内容 -> 无需拷贝。但状态可能还没落盘(例如上一次写盘失败),
-        // 所以这里仍要把状态补写一次再收工。
-        let installed_hook = target_root.join(SITECUSTOMIZE_FILENAME);
-        let same = match (
-            std::fs::read(source.join(SITECUSTOMIZE_FILENAME)),
-            std::fs::read(&installed_hook),
-        ) {
-            (Ok(a), Ok(b)) => a == b,
-            _ => false,
-        };
-        if same {
+        // ---- 内容比对与拷贝 ----
+        //
+        // ★ 参与比对的**必须包含清单**:清单是适用性判据的真相来源,只在
+        // sitecustomize 没变时就跳过拷贝,会让「补丁发版新增了一个已验证版本」
+        // 这类更新永远落不到用户目录 —— 症状是新装用户功能残缺,而机器上
+        // 明明有那个版本的补丁。
+        let contents_match = [SITECUSTOMIZE_FILENAME, MANIFEST_FILENAME]
+            .iter()
+            .all(|name| {
+                match (
+                    std::fs::read(source.join(name)),
+                    std::fs::read(target_root.join(name)),
+                ) {
+                    (Ok(a), Ok(b)) => a == b,
+                    // 源里没有该文件(老补丁无清单)时,只在目标也没有时算一致。
+                    (Err(_), Err(_)) => true,
+                    _ => false,
+                }
+            });
+        if contents_match {
             if state_dirty {
                 let _ = write_state_at(target_root, &state);
             }
@@ -267,12 +344,12 @@ impl Patches {
         let copy_result = (|| -> Result<()> {
             std::fs::create_dir_all(target_root)
                 .with_context(|| format!("创建补丁目录失败: {}", target_root.display()))?;
-            // ★ 只拷这三个名字:sitecustomize + 补丁包。
+            // ★ 只拷这三个名字:清单 + sitecustomize + 补丁包。
             // 绝不能整目录搬 —— 用户目录里还放着 `bili_credentials.json`,
             // 那是扫码产生的凭据,覆盖式播种会把它连同旧内容一起抹掉。
             // 新增补丁文件时必须同步改这里(测试 `credentials_survive_reseeding`
             // 只钉住了「凭据不被碰」,不钉住「该拷的都拷了」)。
-            for name in ["sitecustomize.py", "dtpatch_bili"] {
+            for name in [MANIFEST_FILENAME, SITECUSTOMIZE_FILENAME, "dtpatch_bili"] {
                 let from = source.join(name);
                 let to = target_root.join(name);
                 if from.is_dir() {
@@ -293,9 +370,13 @@ impl Patches {
 
         let _ = write_state_at(target_root, &state);
         log::info!(
-            "已播种本地补丁(id={}, for_bundled={}): {}",
+            "已播种本地补丁(id={}, 播种时生效版={}, 验证版本={:?}): {}",
             state.id.as_deref().unwrap_or("-"),
             state.for_bundled.as_deref().unwrap_or("-"),
+            Patches { root: target_root.to_path_buf() }
+                .manifest()
+                .map(|m| m.verified_deeptutor)
+                .unwrap_or_default(),
             target_root.display()
         );
         Some(target_root.to_path_buf())
@@ -394,6 +475,30 @@ mod tests {
         .unwrap();
     }
 
+    /// 写一份补丁清单 —— 白名单校验的输入。
+    fn install_manifest(p: &Patches, verified: &[&str]) {
+        std::fs::create_dir_all(p.root()).unwrap();
+        let m = PatchManifest {
+            id: "bilibili".into(),
+            verified_deeptutor: verified.iter().map(|s| s.to_string()).collect(),
+        };
+        std::fs::write(
+            p.root().join(MANIFEST_FILENAME),
+            serde_json::to_string_pretty(&m).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn enabled_state() -> PatchState {
+        PatchState {
+            initialized: true,
+            enabled: true,
+            for_bundled: Some("1.6.12".into()),
+            id: Some("bilibili".into()),
+            enabled_at: None,
+        }
+    }
+
     #[test]
     fn disabled_by_default() {
         let p = tmp_patches("default");
@@ -405,14 +510,8 @@ mod tests {
     fn same_version_patch_survives() {
         let p = tmp_patches("same");
         install_hook(&p);
-        p.write_state(&PatchState {
-            initialized: true,
-            enabled: true,
-            for_bundled: Some("1.6.12".into()),
-            id: Some("bilibili".into()),
-            enabled_at: None,
-        })
-        .unwrap();
+        install_manifest(&p, &["1.6.12"]);
+        p.write_state(&enabled_state()).unwrap();
         // ★ 这正是与叠加层的核心差异：同版本不被作废
         assert!(p.is_applicable(Some("1.6.12")));
         assert_eq!(
@@ -422,66 +521,106 @@ mod tests {
     }
 
     #[test]
-    fn bundled_change_disables_patch() {
+    fn unverified_version_disables_patch() {
         let p = tmp_patches("drift");
         install_hook(&p);
-        p.write_state(&PatchState {
-            initialized: true,
-            enabled: true,
-            for_bundled: Some("1.6.12".into()),
-            id: Some("bilibili".into()),
-            enabled_at: None,
-        })
-        .unwrap();
-        // 桌面壳升级带来自带新版 -> 补丁停用而不是硬打
+        install_manifest(&p, &["1.6.12"]);
+        p.write_state(&enabled_state()).unwrap();
+        // 生效版不在清单里 -> 补丁停用而不是硬打
         assert!(!p.is_applicable(Some("1.6.13")));
         assert_eq!(p.effective_dir(Some("1.6.13")), None);
+        // 且必须能说清为什么,否则用户只看到「未就绪」而无处排查
+        let why = p.inapplicable_reason(Some("1.6.13")).unwrap();
+        assert!(why.contains("1.6.13"), "原因里应含当前生效版: {why}");
+    }
+
+    /// ★ 本次真机故障的回归测试。
+    ///
+    /// 用户已热更新到 1.6.13（生效版），而补丁播种时记下的基线是内置版
+    /// 1.6.12 —— 旧设计拿"基线 == 生效版"做等值校验，于是补丁被判为不适用，
+    /// 菜单报"未就绪"，而且**重启多少次都不会好**（基线只在 None 时才写）。
+    ///
+    /// 现在判据是「清单白名单」，热更新到已验证的版本必须照常生效。
+    #[test]
+    fn hot_updated_within_verified_set_still_applies() {
+        let p = tmp_patches("hotupdate");
+        install_hook(&p);
+        // 补丁作者声明 1.6.12 与 1.6.13 都验证过
+        install_manifest(&p, &["1.6.12", "1.6.13"]);
+        // 播种时生效版是 1.6.12（基线照旧记成 1.6.12，纯诊断用）
+        p.write_state(&enabled_state()).unwrap();
+        // 用户随后热更新到 1.6.13 -> 生效版变了，但仍在白名单内
+        assert!(
+            p.is_applicable(Some("1.6.13")),
+            "已验证的版本必须在热更新后继续生效"
+        );
+        assert_eq!(p.effective_dir(Some("1.6.13")), Some(p.root().to_path_buf()));
+    }
+
+    /// 反面：白名单必须真的拦人，不能因为"基线字段还在"就放行。
+    #[test]
+    fn stale_baseline_does_not_grant_applicability() {
+        let p = tmp_patches("stalebase");
+        install_hook(&p);
+        install_manifest(&p, &["1.6.12"]);
+        // 基线恰好等于当前生效版 —— 旧设计在这里会放行
+        p.write_state(&enabled_state()).unwrap();
+        assert_eq!(p.state().for_bundled.as_deref(), Some("1.6.12"));
+        assert!(
+            !p.is_applicable(Some("1.6.13")),
+            "基线字段不得再作为放行依据"
+        );
     }
 
     #[test]
     fn missing_hook_is_not_injected() {
         let p = tmp_patches("nohook");
         // 状态启用但没放 sitecustomize.py -> 不注入,别污染 sys.path
-        p.write_state(&PatchState {
-            initialized: true,
-            enabled: true,
-            for_bundled: Some("1.6.12".into()),
-            id: Some("bilibili".into()),
-            enabled_at: None,
-        })
-        .unwrap();
+        install_manifest(&p, &["1.6.12"]);
+        p.write_state(&enabled_state()).unwrap();
         assert_eq!(p.effective_dir(Some("1.6.12")), None);
     }
 
     #[test]
-    fn unknown_bundled_skips_check() {
+    fn unknown_effective_skips_check() {
         let p = tmp_patches("nobundled");
         install_hook(&p);
-        p.write_state(&PatchState {
-            initialized: true,
-            enabled: true,
-            for_bundled: Some("1.6.12".into()),
-            id: Some("bilibili".into()),
-            enabled_at: None,
-        })
-        .unwrap();
-        // 读不到内置版 -> 交给 Python 侧兜底,这里放行
+        install_manifest(&p, &["1.6.12"]);
+        p.write_state(&enabled_state()).unwrap();
+        // 读不到生效版 -> 交给 Python 侧兜底,这里放行
         assert!(p.is_applicable(None));
     }
 
+    /// 老补丁没有清单文件 -> 不拦版本，交给 Python 侧能力探测。
     #[test]
-    fn missing_for_bundled_is_permissive() {
-        let p = tmp_patches("noforbundled");
+    fn missing_manifest_is_permissive() {
+        let p = tmp_patches("nomanifest");
         install_hook(&p);
-        p.write_state(&PatchState {
-            initialized: true,
-            enabled: true,
-            for_bundled: None,
-            id: Some("bilibili".into()),
-            enabled_at: None,
-        })
-        .unwrap();
-        // 没有基线记录 -> 放行,Python 侧按能力探测
+        p.write_state(&enabled_state()).unwrap();
+        assert_eq!(p.manifest(), None);
+        assert!(p.is_applicable(Some("1.9.9")));
+    }
+
+    /// 空清单等同于没清单 -> 放行（不能因为写了空数组就把补丁全禁了）。
+    #[test]
+    fn empty_manifest_is_permissive() {
+        let p = tmp_patches("emptymanifest");
+        install_hook(&p);
+        install_manifest(&p, &[]);
+        p.write_state(&enabled_state()).unwrap();
+        assert_eq!(p.manifest(), None);
+        assert!(p.is_applicable(Some("1.9.9")));
+    }
+
+    /// 清单损坏时必须放行而不是禁掉 —— 宁可不拦，不可拦住。
+    #[test]
+    fn corrupted_manifest_is_permissive() {
+        let p = tmp_patches("badmanifest");
+        install_hook(&p);
+        std::fs::create_dir_all(p.root()).unwrap();
+        std::fs::write(p.root().join(MANIFEST_FILENAME), "{ not json").unwrap();
+        p.write_state(&enabled_state()).unwrap();
+        assert_eq!(p.manifest(), None);
         assert!(p.is_applicable(Some("1.9.9")));
     }
 
@@ -498,14 +637,8 @@ mod tests {
     fn deactivate_keeps_files() {
         let p = tmp_patches("deact");
         install_hook(&p);
-        p.write_state(&PatchState {
-            initialized: true,
-            enabled: true,
-            for_bundled: Some("1.6.12".into()),
-            id: Some("bilibili".into()),
-            enabled_at: None,
-        })
-        .unwrap();
+        install_manifest(&p, &["1.6.12"]);
+        p.write_state(&enabled_state()).unwrap();
         p.deactivate().unwrap();
         assert!(!p.state().is_enabled());
         // 文件还在 —— 可随时重新启用,且回滚不依赖删除
@@ -523,6 +656,17 @@ mod tests {
         std::fs::write(dir.join(SITECUSTOMIZE_FILENAME), hook_body).unwrap();
         std::fs::write(pkg.join("__init__.py"), "# bili patch\n").unwrap();
         std::fs::write(pkg.join("search.py"), "# search\n").unwrap();
+        // 清单也必须出现在安装目录里 —— 播种会把它拷到用户目录,
+        // 不放的话用户目录永远没有清单，判据会退化成永久放行。
+        std::fs::write(
+            dir.join(MANIFEST_FILENAME),
+            serde_json::to_string_pretty(&PatchManifest {
+                id: "bilibili".into(),
+                verified_deeptutor: vec!["1.6.12".into(), "1.6.13".into()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
         // 模拟误入安装目录的编译缓存 —— 播种必须跳过它
         let cache = pkg.join("__pycache__");
         std::fs::create_dir_all(&cache).unwrap();
@@ -589,8 +733,8 @@ mod tests {
         let cred_file = user_root.join("bili_credentials.json");
         std::fs::write(&cred_file, r#"{"SESSDATA":"secret"}"#).unwrap();
 
-        // 模拟一次全量播种(只碰这两个名字)
-        for name in [SITECUSTOMIZE_FILENAME, "dtpatch_bili"] {
+        // 模拟一次全量播种(只碰这三个名字)
+        for name in [MANIFEST_FILENAME, SITECUSTOMIZE_FILENAME, "dtpatch_bili"] {
             let from = bundle.join(name);
             let to = user_root.join(name);
             if from.is_dir() {
@@ -627,10 +771,64 @@ mod tests {
         assert_eq!(state.for_bundled.as_deref(), Some("1.6.12"));
         assert!(user_root.join(SITECUSTOMIZE_FILENAME).is_file());
         assert!(user_root.join("dtpatch_bili").is_dir());
+        // ★ 清单必须一起落盘，否则用户目录永远没有判据来源
+        assert!(
+            user_root.join(MANIFEST_FILENAME).is_file(),
+            "补丁清单必须随内容一起播种"
+        );
+        assert_eq!(
+            p.manifest().map(|m| m.verified_deeptutor),
+            Some(vec!["1.6.12".to_string(), "1.6.13".to_string()])
+        );
         assert_eq!(
             p.effective_dir(Some("1.6.12")),
             Some(user_root.clone()),
             "播种完必须立刻可注入 PYTHONPATH"
+        );
+        // 播种时生效版 1.6.12，但清单覆盖 1.6.13 —— 热更新后仍要生效
+        assert_eq!(
+            p.effective_dir(Some("1.6.13")),
+            Some(user_root.clone()),
+            "已验证的版本在热更新后必须照常生效"
+        );
+    }
+
+    /// ★ 只改清单（补丁代码没动）时也必须重新播种。
+    ///
+    /// 「补丁发版新增了一个已验证版本」是最典型的场景：sitecustomize.py
+    /// 一字节没变，若比对时不看清单，用户目录就会永远停在旧清单，
+    /// 新装用户功能残缺而机器上明明有那个版本的补丁。
+    #[test]
+    fn manifest_only_change_propagates() {
+        let res = fake_bundle("manifest-v1", "# v1\n");
+        let source = res.join("patches");
+        let user_root = std::env::temp_dir()
+            .join(format!("dt-patch-manifest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&user_root);
+
+        Patches::seed_into(&source, &user_root, Some("1.6.13"));
+        let p = Patches { root: user_root.clone() };
+        assert_eq!(p.effective_dir(Some("1.6.14")), None, "1.6.14 尚未验证");
+
+        // 新壳版本：补丁代码没动，只是把 1.6.14 加进了已验证清单
+        std::fs::write(
+            source.join(MANIFEST_FILENAME),
+            serde_json::to_string_pretty(&PatchManifest {
+                id: "bilibili".into(),
+                verified_deeptutor: vec!["1.6.12".into(), "1.6.13".into(), "1.6.14".into()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            Patches::seed_into(&source, &user_root, Some("1.6.14")).is_some(),
+            "只有清单变化时也必须重新播种"
+        );
+        assert_eq!(
+            p.effective_dir(Some("1.6.14")),
+            Some(user_root.clone()),
+            "新增的已验证版本必须立刻生效"
         );
     }
 

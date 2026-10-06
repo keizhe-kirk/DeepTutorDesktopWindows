@@ -726,16 +726,13 @@ fn overlay_python_path(bundled: &BundledRuntimes) -> Option<PathBuf> {
 ///
 /// 判定逻辑在 [`super::patch::Patches::effective_dir`] 里。与叠加层相反,
 /// 这里**不做版本大小比较** —— 补丁的版本号与内置版相同,比较等于自杀;
-/// 改用「补丁记录的基线版本 == 实际生效的 deeptutor 版本」这条等值校验,
-/// 不等就自动停用。
+/// 改用「补丁清单里声明的已验证版本是否包含生效版」这条白名单校验。
 ///
 /// ★ 比的必须是**生效版**而不是内置版。补丁改写的是「最终被 import 的那份
 /// deeptutor」,而 PYTHONPATH 里叠加层排在补丁层**前面** —— 所以后端热更新
-/// 激活新版后,补丁实际打在新版上。此时若拿内置版去比,会把「补丁是给 1.6.12
-/// 写的、现在生效的是 1.6.13」误判成「1.6.12 == 1.6.12,适用」,补丁就会
+/// 激活新版后,补丁实际打在新版上。此时若拿内置版去比,会把「补丁是为 1.6.12
+/// 验证的、现在生效的是 1.6.13」误判成「1.6.12 == 1.6.12,适用」,补丁就会
 /// 打在一个它从未验证过的版本上。
-/// 同理,`seed_beside_runtimes` 记下的基线也必须是生效版,否则首次播种就会
-/// 烙下错误的基线。
 fn patch_python_path(bundled: &BundledRuntimes) -> Option<PathBuf> {
     let patches = super::patch::Patches::detect(Some(runtime::effective_home()));
     patches.effective_dir(effective_deeptutor_version(bundled).as_deref())
