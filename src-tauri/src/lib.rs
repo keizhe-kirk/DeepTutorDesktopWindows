@@ -22,6 +22,7 @@ pub mod tray;
 pub mod updater;
 pub mod autostart;
 pub mod bili_search_window;
+pub mod bili_panel;
 
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Arc};
 
@@ -119,6 +120,9 @@ pub fn run() {
             }
             // 注册 IMA 自定义协议路由
             ima::protocol::register(app.handle())?;
+            // 把「B 站搜索」注入主窗口的沉浸式观看页（见 bili_panel 模块文档）。
+            // 必须排在窗口建好之后，所以放在这里而不是 build 阶段。
+            bili_panel::inject(app.handle());
             // 启动后端引导流程(异步,不阻塞窗口显示)
             backend::boot::spawn(app.handle());
             // 后端就绪后静默查一次有没有新版后端(只提示,不自动装)

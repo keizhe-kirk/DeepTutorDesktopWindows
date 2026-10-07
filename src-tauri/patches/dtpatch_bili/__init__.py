@@ -48,9 +48,13 @@ from deeptutor.reading.ingestion import (  # noqa: E402
 PROVIDER = "bilibili"
 
 #: 字幕来源标识，写进 ``transcript.source``，前端据此提示用户。
-SOURCE_SUBTITLES = "bilibili_subtitles"
-SOURCE_CHAPTERS_ONLY = "bilibili_chapters_only"
-SOURCE_NONE = "bilibili_no_subtitles"
+#: 字幕来源标识，同时写进 ``transcript.source`` 和顶层 ``extractor``。
+#: ★ 取值必须是**连字符**：前端 chunk 8771 就是这么判的
+#:   ``["youtube-no-captions","bilibili-no-subtitles","bilibili-chapters-only"]``，
+#:   写成下划线会让「没有字幕」提示永远不触发（实测踩过）。
+SOURCE_SUBTITLES = "bilibili-subtitles"
+SOURCE_CHAPTERS_ONLY = "bilibili-chapters-only"
+SOURCE_NONE = "bilibili-no-subtitles"
 SOURCE_DISABLED = "disabled"
 
 _MAX_TITLE = 200
@@ -348,61 +352,106 @@ async def _fetch_bilibili_media(request: Any, languages: Any) -> BilibiliMedia:
 
 
 async def _resolve_bilibili(module, url: str, language: Any) -> dict[str, Any]:
-    """Produce the same material dict ``resolve_material`` would, for Bilibili."""
+    """把 B 站链接做成沉浸式观看**原生**能播的 material。
+
+    ★★★ 为什么必须委托上游 reading 摄入流水线，而不是自己往video_learning 写一条
+
+    前端 ``MediaReadingStage``（chunk 4057）这样选播放器::
+
+        "bilibili" === e.source_kind && V ? <B站 iframe> : <YouTube iframe>
+
+    它读的是**顶层** ``material.source_kind`` / ``material.source_url``。
+    而 ``video_learning.service.public_material()`` 只透传、**不摊平**::
+
+        payload = {k: v for k, v in material.items() if k not in {...}}  # source 仍是嵌套
+
+    所以把 ``source_kind`` 写进 ``material["source"]`` 等于**写了个没人读的字段**：
+    BV 号会被当成 YouTube videoId 喂给 ``youtube-nocookie`` iframe，表现就是
+    「播放器空白 / 报错」—— 看着像功能没做，其实是字段放错了层级。
+
+    上游 reading 侧本来就完整支持 B 站（``SourceKind.BILIBILI`` +
+    ``IngestionService._process_bilibili``），且 ``MaterialRecord.to_dict()`` 的
+    字段与前端读的**完全一致**。于是：
+
+    1. 委托 ``ReadingIngestionService`` 做摄入 —— 目录行、reading store 的
+       outline / unit_refs / extractor 全由上游产出，契约天然对齐；
+    2. 再用**同一个 material_id** 补写 TimedMediaStore，让 video-learning 的
+       字幕 / 笔记 / 进度 / subtitles.vtt 端点继续可用；
+    3. 返回体把顶层字段补齐（``public_material`` 不摊平，只能自己补）。
+    """
+
+    from deeptutor.reading.catalog_models import IngestionStatus
+    from deeptutor.reading.catalog_store import ReadingCatalogStore
+    from deeptutor.reading.ingestion import ReadingIngestionService, ReadingStore
 
     request = _parse(url)  # may raise ReadingError -> caller maps it
-    cookies = _credentials()
-
-    from deeptutor.reading.ingestion import ReadingError
-
     langs = _language_list(language)
 
-    # ★ 走自己的实现（见 ``_fetch_bilibili_media`` 的文档：上游那条路
-    # 接口选错 + 不带 cookie + UA 被当爬虫，三重失效）。
+    # 让上游的摄入流水线用**我们**的抓取实现（带登录态 + 真实 UA），
+    # 同时把结果截下来，避免为了拿 cues 再打一次网络。
+    captured: dict[str, Any] = {}
+
+    async def _loader(url_value: str, languages: Any):
+        media = await _fetch_bilibili_media(_parse(url_value), languages)
+        captured["media"] = media
+        return media
+
+    catalog = ReadingCatalogStore()
+    ingestion = ReadingIngestionService(
+        ReadingStore(catalog.root), catalog, bilibili_loader=_loader
+    )
+
+    # ---- 1) 走上游摄入：产出目录行(顶层 source_kind=bilibili / render_mode=video)
     try:
-        media = await _fetch_bilibili_media(request, langs)
-    except ReadingError:
-        raise
-    except Exception as exc:  # noqa: BLE001 - surface as a user-facing failure
-        raise module.TimedMediaError(
-            f"Bilibili 无法加载该视频({type(exc).__name__}: {exc})。"
-        ) from exc
+        record = ingestion.queue_url(url)
+    except Exception as exc:  # noqa: BLE001
+        raise module.TimedMediaError(f"Bilibili 链接无法入队：{exc}") from exc
 
+    try:
+        record = await ingestion.process_url(
+            record.material_id, preferred_languages=langs
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise module.TimedMediaError(f"Bilibili 解析失败：{exc}") from exc
+
+    #process_url 内部会吞异常并把状态置成 FAILED，所以必须自己判一次。
+    if getattr(record, "status", None) is not IngestionStatus.READY:
+        detail = str(getattr(record, "error_detail", "") or "未知原因")
+        raise module.TimedMediaError(f"Bilibili 解析失败：{detail}")
+
+    media = captured.get("media")
+    if media is None:  # 兜底：理论上 loader 一定被调过
+        media = await _fetch_bilibili_media(_parse(record.source_url), langs)
+
+    # ---- 2) 组装 video_learning 侧的 cues
     cues = _segments_to_cues(media.segments)
-    chapters = media.segments if not cues else []
-
-    # Bilibili exposes chapters through view_points and subtitles separately;
-    # when subtitles are missing we still want *some* timeline, so chapters
-    # become the cue source (this is exactly what the reading area does with
-    # its ``bilibili-chapters-only`` fallback).
-    source_kind = SOURCE_SUBTITLES
-    if not cues and chapters:
-        cues = _segments_to_cues(chapters)
-        source_kind = SOURCE_CHAPTERS_ONLY
-    elif not cues:
-        source_kind = SOURCE_NONE
-    if not cookies and source_kind != SOURCE_NONE:
+    extractor = SOURCE_SUBTITLES
+    if not cues:
+        # 没有字幕就退回章节标记，至少留一条时间轴（上游也是这么兜的）。
+        cues = _segments_to_cues(media.chapters)
+        extractor = SOURCE_CHAPTERS_ONLY if cues else SOURCE_NONE
+    if not _credentials() and extractor != SOURCE_NONE:
         _log("未配置 B 站登录态，字幕/章节可能不可用")
 
+    material_id = str(record.material_id)
+    duration = int(float(getattr(media, "duration_seconds", 0) or 0))
+    title = str(getattr(media, "title", "") or material_id)[:_MAX_TITLE]
+    cover = str(getattr(media, "cover_url", "") or "")
+    source_url = str(getattr(record, "source_url", "") or url)
+
+    # ---- 3) 用同一个 material_id 写 TimedMediaStore（字幕/笔记/进度端点靠它）
     store = module.get_timed_media_store()
-    material_id = module.material_id_for(f"bili:{request.bvid}:p{media.page_number}")
     try:
         existing = store.get(material_id)
     except module.TimedMediaNotFound:
         existing = {}
 
-    duration = int(float(media.duration_seconds or 0))
     learning = (
         existing["learning"]
         if isinstance(existing.get("learning"), dict)
         else {"last_position": request.entry_time_seconds}
     )
     learning.setdefault("last_position", request.entry_time_seconds)
-
-    title = (media.title or request.bvid)[:_MAX_TITLE]
-    canonical = request.canonical_url
-    if media.page_number > 1:
-        canonical = f"{canonical}?p={media.page_number}"
 
     material = {
         "version": 1,
@@ -411,35 +460,35 @@ async def _resolve_bilibili(module, url: str, language: Any) -> dict[str, Any]:
         "created_at": existing.get("created_at")
         or module.datetime.now(module.timezone.utc).isoformat(),
         "source": {
-            # ★ The two fields the frontend switches on: ``provider`` selects the
-            # Bilibili iframe branch, ``video_id``/``url`` feed its parser.
+            #嵌套那份保留：video-learning 自己读它，前端读下面摊平的顶层字段。
             "provider": PROVIDER,
             "source_kind": PROVIDER,
             "video_id": request.bvid,
             "bvid": request.bvid,
-            "page": media.page_number,
-            "url": canonical,
+            "page": int(getattr(media, "page_number", 1) or 1),
+            "url": source_url,
             "entry_time_seconds": request.entry_time_seconds,
         },
         "metadata": {
             "title": title,
+            # BilibiliMedia 没有 author 字段（上游 dataclass 里就没有），
+            # 原生页面的 meta 行也不显示 UP 主，留空即可。
             "author": "",
             "duration_seconds": duration,
-            "thumbnail_url": media.cover_url or "",
+            "thumbnail_url": cover,
         },
         "transcript": {
             "status": "ready" if cues else "unavailable",
-            "reason": "" if cues else source_kind,
+            "reason": "" if cues else extractor,
             "language": langs[0] if langs else "",
-            "source": source_kind,
+            "source": extractor,
             "cues": cues,
         },
         "segments": module.build_segments(cues),
         "learning": learning,
         "provider_cache": {
-            "bilibili_page": media.page_number,
-            "bilibili_cid": media.cid,
-            "bilibili_chapters": len(chapters),
+            "bilibili_page": int(getattr(media, "page_number", 1) or 1),
+            "bilibili_cid": int(getattr(media, "cid", 0) or 0),
         },
         "_caption_text_version": 1,
     }
@@ -454,15 +503,47 @@ async def _resolve_bilibili(module, url: str, language: Any) -> dict[str, Any]:
         store.save(material)
 
     _log(
-        f"已解析 {request.bvid} P{media.page_number}: "
-        f"{len(cues)} 条字幕/章节, 来源={source_kind}, 时长={duration}s"
+        "已解析 %s P%s：%d 条字幕/章节，extractor=%s，时长=%ds，material_id=%s",
+        request.bvid,
+        getattr(media, "page_number", 1),
+        len(cues),
+        extractor,
+        duration,
+        material_id,
     )
+
+    # ---- 4) 返回体：顶层字段是前端唯一认的形状
     payload = module.public_material(material, provider=PROVIDER)
-    # ★ public_material 的 else 分支会塞``kind: "youtube_iframe"``,而它的
-    # video_id 取自 source["video_id"] —— 对 B 站来说那是个 BV 号,前端可能
-    # 误判成 YouTube 视频。这里整个去掉:前端本来就会pop("playback") 自己拼
-    # player.bilibili.com 的iframe,留着反而有害。
+    # ★ public_material 的 else 分支会塞 kind:"youtube_iframe" 且 video_id 取自
+    #   source["video_id"] —— 对 B 站来说那是 BV 号，前端可能误判成 YouTube 视频。
+    #   整个去掉：前端本来就会自己拼 player.bilibili.com 的 iframe。
     payload.pop("playback", None)
+
+    flat = record.to_dict() if hasattr(record, "to_dict") else {}
+    if isinstance(flat, dict):
+        payload.update(flat)
+
+    payload.update(
+        {
+            "material_id": material_id,
+            "title": title,
+            "author": "",
+            "source": material["source"],
+            "source_kind": PROVIDER,
+            "source_url": source_url,
+            "render_mode": "video",
+            "cover_url": cover,
+            "thumbnail_url": cover,
+            "duration_seconds": duration,
+            "status": "ready",
+            "progress": 100,
+            "extractor": extractor,
+            "transcript": material["transcript"],
+            "segments": material["segments"],
+            "learning": material["learning"],
+            "metadata": material["metadata"],
+        }
+    )
     return payload
 
 
@@ -472,6 +553,20 @@ def _language_list(language: Any) -> list[str]:
     if isinstance(language, (list, tuple)):
         return [str(v).strip() for v in language if str(v).strip()]
     return ["zh-CN", "zh-Hans", "zh", "en"]
+
+
+async def resolve_bilibili_url(material_id: str, url: str) -> dict[str, Any]:
+    """按 B 站链接重新解析并覆盖已有 material。
+
+    给 ``transcript/refresh`` 用：字幕可能刚补上登录态，得重抓一遍。
+    ``material_id`` 只用于日志——真正的 id 由上游 ``queue_url`` 从 URL 派生，
+    所以同一个链接一定会命中同一条目录记录。
+    """
+
+    from deeptutor.video_learning import service as vl
+
+    _log("按字幕刷新请求重新解析 B 站材料 material_id=%s", material_id)
+    return await _resolve_bilibili(vl, url, "")
 
 
 # --------------------------------------------------------------------------
