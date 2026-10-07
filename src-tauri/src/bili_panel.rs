@@ -297,6 +297,70 @@ const PANEL_JS: &str = r##"
 })();
 "##;
 
+/// 真机验证用的后门：把要执行的 JS 写进 `%LOCALAPPDATA%\DeepTutor\bili_eval.js`，
+/// 应用启动后会在主窗口执行一次（然后删掉文件）。
+///
+/// ★ 为什么要有这个后门：WebView2 只有在**进程能派生子进程**时才起得来。
+///   从终端启动的应用在工具的 Job 对象里，`msedgewebview2.exe` 常常起不来
+///   （症状：应用活着、窗口在、客户区纯白/纯黑、wry 一条错都不报）。
+///   而任务计划程序被安全策略拉黑、`explorer.exe` 又不继承环境变量 ——
+///   文件标记是唯一不依赖启动方式的通道。
+///
+/// ★★ 只在 debug 构建里存在。这是「往本地目录丢个文件就能让应用执行任意
+///   JS」的后门，**绝不能随发布版出去** —— release 构建下这段代码根本不存在。
+#[cfg(debug_assertions)]
+fn eval_flag_path() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("LOCALAPPDATA")?;
+    Some(std::path::PathBuf::from(base).join("DeepTutor").join("bili_eval.js"))
+}
+
+#[cfg(debug_assertions)]
+fn spawn_eval_flag_watcher(app: tauri::AppHandle) {
+    let Some(path) = eval_flag_path() else { return };
+    std::thread::spawn(move || {
+        // ★ 必须**重复**执行而不是一次：脚本里很可能要 location.assign 到沉浸式观看页，
+        //   而导航会把 JS 上下文整个换掉，一次性 eval 的脚本随页面一起消失。
+        //   脚本自己用 sessionStorage 做幂等（见 .tmp/bili_demo.js）。
+        //   文件不自动删 —— 验证完手动删，否则会一直重复。
+        let mut executed = 0usize;
+        let mut seen = false;
+        for _round in 0..60 {
+            std::thread::sleep(Duration::from_millis(2500));
+            match std::fs::read_to_string(&path) {
+                Ok(script) => {
+                    if script.trim().is_empty() {
+                        continue;
+                    }
+                    // ★ 第一次读到才算「开始」；之后读不到 = 验证结束，退出。
+                    if !seen {
+                        seen = true;
+                        log::info!("检测到 bili_eval.js，开始重复执行");
+                    }
+                    let Some(win) = app.get_webview_window("main") else {
+                        continue;
+                    };
+                    if win.eval(&script).is_ok() {
+                        executed += 1;
+                        if executed == 1 {
+                            log::info!("bili_eval.js 已执行（{} 字节）", script.len());
+                        }
+                    }
+                }
+                Err(_) => {
+                    // ★ 没出现过就继续等；出现过又消失才收工。
+                    //   写成"读不到就 return"会在文件还没创建时直接退出——
+                    //   验证脚本往往启动后才放标记，一探测扑空就再也不会执行（踩过）。
+                    if seen {
+                        log::info!("bili_eval.js 已移除，监听结束（共执行 {executed} 次）");
+                        return;
+                    }
+                }
+            }
+        }
+        log::info!("bili_eval.js 监听轮次用尽，共执行 {executed} 次");
+    });
+}
+
 /// 把面板脚本注入主窗口。
 ///
 /// 主窗口来自 `tauri.conf.json` 的 `app.windows`，不是Rust 建的，所以拿不到
@@ -316,6 +380,8 @@ pub fn inject(app: &tauri::AppHandle) {
             match win.eval(PANEL_JS) {
                 Ok(()) => {
                     log::info!("B 站搜索面板已注入主窗口（第 {attempt} 次尝试）");
+                    #[cfg(debug_assertions)]
+                    spawn_eval_flag_watcher(handle.clone());
                     return;
                 }
                 Err(e) => {
