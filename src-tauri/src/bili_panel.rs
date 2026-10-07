@@ -363,33 +363,45 @@ fn spawn_eval_flag_watcher(app: tauri::AppHandle) {
 
 /// 把面板脚本注入主窗口。
 ///
-/// 主窗口来自 `tauri.conf.json` 的 `app.windows`，不是Rust 建的，所以拿不到
-/// builder 上的 `on_page_load`。这里用「延时 + 有限次重试 + eval」：
-/// 页面可能还没加载完，第一次 eval 会落空。
+/// ★★ 必须**周期性重复**注入，绝不能只打一次。
+///
+/// 主窗口一开始加载的不是 Web UI，而是壳自己的启动页（`dist/index.html`）。
+/// 注入脚本装好 `MutationObserver` 之后一直待在**那份文档**里；等后端就绪、
+/// 前端 `location.replace(http://127.0.0.1:<web_port>)` 跳到 Web UI 时，整个
+/// JS 上下文被整体替换 —— 脚本和它的观察者一起消失。
+///
+/// 症状极具迷惑性：注入日志明明打了「已注入（第 0 次尝试）」，Rust 侧一切正常，
+/// 但沉浸式观看页上就是没有那个按钮（实测 v0.2.12 就是这样）。
+///
+/// 脚本自带 `window.__dtBiliPanel` 幂等标记，所以重复注入是免费的；
+/// 顺带还能自愈「用户手动刷新页面」这类硬导航。
+///
+/// 主窗口来自 `tauri.conf.json` 的 `app.windows`，不是Rust 建的，拿不到
+/// builder 上的 `on_page_load`，所以用「延时 + 周期 eval」。
 pub fn inject(app: &tauri::AppHandle) {
     if INJECTED.swap(true, Ordering::SeqCst) {
         return;
     }
     let handle = app.clone();
     std::thread::spawn(move || {
-        for attempt in 0..12u32 {
-            std::thread::sleep(Duration::from_millis(1200));
+        // 真机验证后门（仅 debug 构建存在）必须独立起线程：
+        // 它挂在periodic 注入循环里，而那个循环是`loop`，后面的代码不可达。
+        #[cfg(debug_assertions)]
+        spawn_eval_flag_watcher(handle.clone());
+
+        let mut ok = 0u32;
+        loop {
+            std::thread::sleep(Duration::from_millis(3000));
             let Some(win) = handle.get_webview_window("main") else {
                 continue;
             };
-            match win.eval(PANEL_JS) {
-                Ok(()) => {
-                    log::info!("B 站搜索面板已注入主窗口（第 {attempt} 次尝试）");
-                    #[cfg(debug_assertions)]
-                    spawn_eval_flag_watcher(handle.clone());
-                    return;
-                }
-                Err(e) => {
-                    log::debug!("注入重试 {attempt}: {e}");
+            if win.eval(PANEL_JS).is_ok() {
+                ok += 1;
+                if ok == 1 {
+                    log::info!("B 站搜索面板已注入主窗口（周期性注入，每 3s 一次，脚本自带幂等）");
                 }
             }
         }
-        log::warn!("B 站搜索面板注入失败，已放弃（不影响其他功能）");
     });
 }
 #[cfg(test)]
@@ -458,7 +470,35 @@ mod tests {
         );
     }
 
-    /// 面板要能调 `bili_search`，所以主窗口必须在 capability 的 windows 里。
+    /// ★ 回归守卫：注入必须**周期性**执行，不能只打一次。
+///
+/// v0.2.12 就是这里翻的车：一次性 eval 把脚本打在壳的**启动页**上，
+/// 后端就绪后前端 `location.replace` 换掉整个文档，脚本跟着消失，
+/// 于是「注入日志一切正常，但沉浸式观看页上没有那个按钮」。
+#[test]
+fn injection_is_periodic_not_one_shot() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/bili_panel.rs"),
+    )
+    .expect("应能读到自己的源码");
+    let body = src
+        .split_once("pub fn inject")
+        .map(|(_, b)| b)
+        .expect("应有 inject 函数");
+    // ★ 必须在 `mod tests` 之前截断 —— 本测试的断言文案里就含
+    // `for attempt in 0..` 这个字符串，不截断会自己匹配自己，恒失败。
+    let body = body.split("#[cfg(test)]").next().unwrap_or(body);
+    assert!(
+        body.contains("loop {"),
+        "inject 里必须有无限循环的周期注入，否则导航一次就丢"
+    );
+    assert!(
+        !body.contains("for attempt in 0.."),
+        "不要退回「有限次重试」—— 那正是 v0.2.12 按钮不出现的根因"
+    );
+}
+
+/// 面板要能调 `bili_search`，所以主窗口必须在 capability 的 windows 里。
     #[test]
     fn main_window_may_invoke_bili_search() {
         let caps = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities/main.json");
