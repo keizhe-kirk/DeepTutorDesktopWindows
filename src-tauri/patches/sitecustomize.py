@@ -28,6 +28,10 @@ import traceback
 
 _SERVICE = "deeptutor.video_learning.service"
 _ROUTER = "deeptutor.api.routers.video_learning"
+# ★ 1.6.14 起前端加视频走的是 reading 的导入端点，不再调 video_learning 的
+#   resolve，所以字幕注入必须也钩 reading 路由 —— 否则补丁只对老路径有效。
+_READING = "deeptutor.api.routers.reading"
+_TARGETS = (_SERVICE, _ROUTER, _READING)
 
 
 def _log(msg: str) -> None:
@@ -44,7 +48,7 @@ class _VideoLearningPatch:
         return None
 
     def find_spec(self, fullname, path=None, target=None):
-        if fullname not in (_SERVICE, _ROUTER):
+        if fullname not in _TARGETS:
             return None
         import importlib.util
 
@@ -70,12 +74,18 @@ class _VideoLearningPatch:
                     from dtpatch_bili import apply_patch
 
                     apply_patch(module)
-                else:
+                elif fullname == _ROUTER:
                     from dtpatch_bili import router as bili_router
 
                     # ★ 必须在 include_router 之前完成 —— router 模块 import 完
                     # 就立刻注册,那时app 还没遍历它的 routes。
                     bili_router.install(module)
+                else:
+                    # reading 路由不新增端点，只是把 _ingestion() 换成注入我们
+                    # loader 的版本，因此没有 include_router 那条时序约束。
+                    from dtpatch_bili import reading_patch
+
+                    reading_patch.install(module)
             except Exception:  # noqa: BLE001 - never break the backend
                 _log(f"注入 {fullname} 失败，相关功能本次不可用:")
                 traceback.print_exc(file=sys.stderr)

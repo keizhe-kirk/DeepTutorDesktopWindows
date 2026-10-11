@@ -59,37 +59,33 @@ const PANEL_JS: &str = r##"
     return null;
   }
 
-  function invokeTauri(cmd, args) {
-    var internals = window.__TAURI_INTERNALS__;
-    if (!internals || typeof internals.invoke !== 'function') {
-      return Promise.reject(new Error('Tauri IPC 不可用'));
-    }
-    return internals.invoke(cmd, args || {});
-  }
-
-  // ---- 搜索：优先同源 fetch，IPC 只作兜底----
+  // ---- 搜索：同源 fetch ----
   //
-  // ★ 为什么不用 Tauri IPC 走主路：主窗口一开始是本地页，后端就绪后前端
+  // ★ 为什么不用 Tauri IPC：主窗口一开始是本地页，后端就绪后前端
   //   location.replace 到 http://127.0.0.1:<web_port> —— 这时它对 Tauri 是
   //   **远程来源**。Tauri 2 的 capability 若没有 `remote.urls` 声明，
   //   对远程来源一律不生效，于是每条命令都被 ACL 拒：
   //   `Command bili_search not allowed by ACL`（v0.2.13 实测）。
-  //   同源 fetch 走的是 HTTP，完全不经过 IPC 层，因此不受 capability 影响。
-  //   顺带好处：面板不依赖任何 Rust 命令，换前端落点也能用。
+  //   同源 fetch 走 HTTP，完全不经过 IPC 层，因此不受 capability 影响。
+  //
+  // ★★ 不要再加「fetch 失败就回落 IPC」。v0.2.14 犯过这个错：端点 404 时
+  //   fetch 抛错被 catch 吞掉，回落 IPC 又报 ACL ——用户看到的仍是
+  //   `not allowed by ACL`，而真因是**后端补丁没启用**（后端热更新到了
+  //   白名单之外的版本）。错误被替换成误导性文案，排查成本极高。
+  //   现在直接把真实原因摊开，并对 404 给出可执行的判断依据。
   var SEARCH_API = '/api/video-learning/bilibili/search';
   function search(term, page) {
     var url = SEARCH_API + '?q=' + encodeURIComponent(term)
                        + '&page=' + encodeURIComponent(page);
-    if (typeof fetch !== 'function') {
-      return invokeTauri('bili_search', { keyword: term, page: page });
-    }
     return fetch(url, { credentials: 'same-origin', cache: 'no-store' })
       .then(function (r) {
+        if (r.status === 404) {
+          throw new Error('HTTP 404 —— 后端没有挂上 B 站搜索端点，通常是'
+            + '补丁对当前后端版本未启用（版本不在白名单）。实际后端版本请看'
+            + '托盘「检查后端更新…」');
+        }
         if (!r.ok) { throw new Error('HTTP ' + r.status); }
         return r.json();
-      })
-      .catch(function () {
-        return invokeTauri('bili_search', { keyword: term, page: page });
       });
   }
 
@@ -540,24 +536,30 @@ fn injection_is_periodic_not_one_shot() {
             PANEL_JS.contains("credentials: 'same-origin'"),
             "同源 fetch 要显式带 cookie，否则鉴权失败"
         );
-        // fetch 必须是 `search()` 的返回主路；IPC 只在它失败时兜底。
         let primary = PANEL_JS
             .find("return fetch(url")
-            .expect("search() 应以 fetch 为主路返回");
+            .expect("search() 应以 fetch 为返回主路");
         assert!(
-            PANEL_JS[primary..].contains("invokeTauri('bili_search'"),
-            "fetch 之后要有 IPC 兜底（fetch 失败时仍能搜）"
+            !PANEL_JS.contains("invokeTauri"),
+            "★ 不要在fetch 失败时回落 Tauri IPC —— 主窗口是远程来源，IPC 必然被\
+             ACL 拒，回落只会把真实错误（如 404 补丁未启用）替换成 \
+             `not allowed by ACL`，排查成本极高（v0.2.14 实测踩过）"
+        );
+        assert!(
+            PANEL_JS[primary..].contains("r.status === 404"),
+            "404 要单独处理并给出可执行提示，而不是笼统的 HTTP 错误"
         );
     }
 
-    /// IPC 兜底要能工作，主窗口仍须在 capability 的 windows 里。
+    /// 面板已完全不走 IPC，但仍要记录一条事实：主窗口的 windows 列表里
+    /// 有 `"main"`（托盘的搜索窗口复用同一份 capability）。
     #[test]
-    fn main_window_may_invoke_bili_search() {
+    fn main_window_is_listed_in_capability() {
         let caps = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities/main.json");
         let text = std::fs::read_to_string(&caps).expect("capabilities/main.json 应存在");
         assert!(
             text.contains("\"main\""),
-            "主窗口不在 capability 的 windows 里 → IPC 兜底也用不了"
+            "主窗口不在 capability 的 windows 里"
         );
     }
 }
