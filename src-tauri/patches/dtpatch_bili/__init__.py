@@ -224,6 +224,114 @@ def _is_subtitle_cdn(url: str) -> bool:
     )
 
 
+# --------------------------------------------------------------------------
+# 风控防护：节流 / -412 退避 / 匿名设备指纹（与 search.py 同源结论）
+#
+# 2026-10-11 真机踩坑：导入 B 站视频时 ``/x/web-interface/view`` 连续 5 次
+# ``code=-412``（13:36:37~13:37:43，用户在连点「重试」），ban 窗口约 9 分钟。
+# 而同一时刻**匿名单发/6 连发/带登录态都复现不出来** —— 说明 -412 是
+# **临时速率风控**：触发靠「请求密集」，解法与 search.py 一致（节流 + 指纹
+# + 退避），另加一道**串行锁**杜绝连点重试造成的并发风暴。
+# --------------------------------------------------------------------------
+
+#: 命中 -412 时的退避序列（秒），与 :mod:`.search` 保持一致。
+_RISK_BACKOFF = (4.0, 8.0, 16.0)
+
+#: 匿名设备指纹缓存（``finger/spi`` 的 ``b_3``，即 ``buvid3``）。
+#: 没有登录态时缺 ``buvid3`` 的请求更容易被风控（search.py 实测结论）。
+_anon_buvid3: str | None = None
+
+#: B 站解析的全局串行锁。用户连点「重试」会并发触发解析，并发打
+#: ``api.bilibili.com`` 正是 -412 的直接诱因；串行化后同一时间只有一个
+#: 解析在打接口，配合节流把速率压到风控线以下。
+_ingest_gate: Any = None
+_gate_loop: Any = None
+
+
+def _gate() -> Any:
+    """惰性创建 :class:`asyncio.Lock`。
+
+    ★ 必须 loop-aware：``asyncio.Lock`` 一旦在某个事件循环里用过就绑死
+    该循环，换循环再用直接 ``RuntimeError``（回归测试多次 ``asyncio.run``
+    就是两个循环）。检测到换循环就重建。
+    """
+
+    global _ingest_gate, _gate_loop
+    loop = asyncio.get_running_loop()
+    if _ingest_gate is None or _gate_loop is not loop:
+        _ingest_gate = asyncio.Lock()
+        _gate_loop = loop
+    return _ingest_gate
+
+
+async def _api_call(client: Any, path: str, params: dict[str, Any]) -> dict[str, Any]:
+    """打一个 B 站 Web API，带节流与 -412 指数退避。
+
+    ★ 节流器与搜索**共享**（``search._throttle``）：B 站的风控按客户端
+    整体速率算，搜索与解析互相让速才是正确姿势。
+    """
+
+    from .search import _throttle
+
+    for attempt in range(len(_RISK_BACKOFF) + 1):
+        await _throttle.wait()
+        resp = await client.get(f"{_API}{path}", params=params)
+        try:
+            data = resp.json()
+        except ValueError:
+            raise RuntimeError(
+                f"Bilibili 接口 {path} 返回了非 JSON 响应（HTTP {resp.status_code}）"
+            ) from None
+        code = data.get("code") if isinstance(data, dict) else None
+        if code == 0:
+            payload = data.get("data")
+            return payload if isinstance(payload, dict) else {}
+        if code == -412:
+            if attempt < len(_RISK_BACKOFF):
+                delay = _RISK_BACKOFF[attempt]
+                _log(
+                    "B 站风控 -412（%s），%.0fs 后重试（第 %d 次）",
+                    path,
+                    delay,
+                    attempt + 1,
+                )
+                _throttle.widen(delay)
+                await asyncio.sleep(delay)
+                continue
+            raise RuntimeError(
+                "B 站风控拦截了请求（-412）：请求过于频繁。"
+                "请等 1~2 分钟再点重试，连续快速重试会延长拦截时间"
+            )
+        raise RuntimeError(f"Bilibili 接口 {path} 返回 code={code}")
+
+
+async def _ensure_buvid3(client: Any, cookies: dict[str, str]) -> None:
+    """没有 ``buvid3`` 时取一个匿名设备指纹塞进 cookie。
+
+    ``x/frontend/finger/spi`` 是 B 站给匿名客户端发设备指纹的接口
+    （实测可用，返回 ``b_3`` 即 ``buvid3``）。指纹按进程缓存，取一次就好。
+    可选增强：失败绝不影响主流程。
+    """
+
+    global _anon_buvid3
+    if cookies.get("buvid3"):
+        return
+    if _anon_buvid3:
+        cookies["buvid3"] = _anon_buvid3
+        return
+    try:
+        resp = await client.get(f"{_API}/x/frontend/finger/spi")
+        data = resp.json()
+        b3 = str(((data or {}).get("data") or {}).get("b_3") or "")
+    except Exception as exc:  # noqa: BLE001
+        _log("取匿名 buvid3 失败（不影响主流程）: %s", exc)
+        return
+    if b3:
+        _anon_buvid3 = b3
+        cookies["buvid3"] = b3
+        _log("已取匿名 buvid3 设备指纹（无登录态）")
+
+
 async def _fetch_bilibili_media(request: Any, languages: Any) -> BilibiliMedia:
     """抓 B 站元数据 + 字幕 + 章节。
 
@@ -249,96 +357,92 @@ async def _fetch_bilibili_media(request: Any, languages: Any) -> BilibiliMedia:
         raise RuntimeError("Bilibili import requires httpx") from exc
 
     langs = _language_list(languages)
-    cookies = _credentials()
+    cookies = dict(_credentials())
     headers = {
         "Accept": "application/json",
         "Referer": "https://www.bilibili.com/",
         "User-Agent": _UA,
     }
-    if cookies:
-        headers["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
 
-    async with httpx.AsyncClient(
-        timeout=15, follow_redirects=True, headers=headers
-    ) as client:
-
-        async def api(path: str, params: dict[str, Any]) -> dict[str, Any]:
-            resp = await client.get(f"{_API}{path}", params=params)
-            data = resp.json()
-            if not isinstance(data, dict) or data.get("code") != 0:
-                raise RuntimeError(
-                    f"Bilibili 接口 {path} 返回 code="
-                    f"{(data or {}).get('code') if isinstance(data, dict) else '?'}"
+    # ★ 串行锁：连点「重试」/并发导入时，同一时间只有一个解析在打 B 站
+    #   —— 并发请求正是 -412 风控的直接诱因（2026-10-11 真机踩坑）。
+    async with _gate():
+        async with httpx.AsyncClient(
+            timeout=15, follow_redirects=True, headers=headers
+        ) as client:
+            # 匿名时补一个设备指纹，降低 -412 概率（登录态自带 buvid3）。
+            await _ensure_buvid3(client, cookies)
+            if cookies:
+                client.headers["Cookie"] = "; ".join(
+                    f"{k}={v}" for k, v in cookies.items()
                 )
-            payload = data.get("data")
-            return payload if isinstance(payload, dict) else {}
 
-        view = await api("/x/web-interface/view", {"bvid": request.bvid})
-        pages = view.get("pages") if isinstance(view.get("pages"), list) else []
-        if not pages:
-            raise RuntimeError("Bilibili 未返回可播放分P")
+            view = await _api_call(client, "/x/web-interface/view", {"bvid": request.bvid})
+            pages = view.get("pages") if isinstance(view.get("pages"), list) else []
+            if not pages:
+                raise RuntimeError("Bilibili 未返回可播放分P")
 
-        page_index = min(int(getattr(request, "page_number", 1) or 1), len(pages)) - 1
-        page = pages[page_index] if isinstance(pages[page_index], dict) else {}
-        cid = int(page.get("cid") or 0)
-        if cid <= 0:
-            raise RuntimeError("Bilibili 未返回 cid")
+            page_index = min(int(getattr(request, "page_number", 1) or 1), len(pages)) - 1
+            page = pages[page_index] if isinstance(pages[page_index], dict) else {}
+            cid = int(page.get("cid") or 0)
+            if cid <= 0:
+                raise RuntimeError("Bilibili 未返回 cid")
 
-        duration = float(page.get("duration") or view.get("duration") or 0)
-        title = str(page.get("part") or view.get("title") or request.bvid).strip()
-        cover = _absolute(str(view.get("pic") or ""))
+            duration = float(page.get("duration") or view.get("duration") or 0)
+            title = str(page.get("part") or view.get("title") or request.bvid).strip()
+            cover = _absolute(str(view.get("pic") or ""))
 
-        # ---- 章节 ----
-        chapters: list[Any] = []
-        # ---- 字幕 ----
-        segments: list[Any] = []
-        try:
-            # ★ 关键：必须用 wbi 版，且 cid 要用真实值（不是 1）。
-            player = await api(
-                "/x/player/wbi/v2", {"bvid": request.bvid, "cid": cid}
+            # ---- 章节 ----
+            chapters: list[Any] = []
+            # ---- 字幕 ----
+            segments: list[Any] = []
+            try:
+                # ★ 关键：必须用 wbi 版，且 cid 要用真实值（不是 1）。
+                player = await _api_call(
+                    client, "/x/player/wbi/v2", {"bvid": request.bvid, "cid": cid}
+                )
+            except Exception as exc:  # noqa: BLE001 - 字幕失败不该拖垮整条链路
+                _log("播放器接口不可用（%s），仅返回元数据", exc)
+                player = {}
+
+            from deeptutor.reading.ingestion import normalize_transcript_segments as _norm
+
+            chapters = build_transcript_segments(_norm(player.get("view_points") or []))
+
+            subtitle_root = player.get("subtitle")
+            rows = (
+                subtitle_root.get("subtitles")
+                if isinstance(subtitle_root, dict)
+                and isinstance(subtitle_root.get("subtitles"), list)
+                else []
             )
-        except Exception as exc:  # noqa: BLE001 - 字幕失败不该拖垮整条链路
-            _log("播放器接口不可用（%s），仅返回元数据", exc)
-            player = {}
-
-        from deeptutor.reading.ingestion import normalize_transcript_segments as _norm
-
-        chapters = build_transcript_segments(_norm(player.get("view_points") or []))
-
-        subtitle_root = player.get("subtitle")
-        rows = (
-            subtitle_root.get("subtitles")
-            if isinstance(subtitle_root, dict)
-            and isinstance(subtitle_root.get("subtitles"), list)
-            else []
-        )
-        chosen = _pick_subtitle(rows)
-        if chosen:
-            url = _absolute(str(chosen.get("subtitle_url") or ""))
-            if _is_subtitle_cdn(url):
-                try:
-                    resp = await client.get(url)
-                    if len(resp.content) > MAX_TRANSCRIPT_BYTES * 2:
-                        _log("字幕体积超限，忽略")
-                    else:
-                        resp.raise_for_status()
-                        payload = resp.json()
-                        body = (
-                            payload.get("body")
-                            if isinstance(payload, dict)
-                            and isinstance(payload.get("body"), list)
-                            else []
-                        )
-                        segments = build_transcript_segments(_norm(body))
-                        _log(
-                            "已取到字幕 lan=%s 条数=%d",
-                            chosen.get("lan"),
-                            len(segments),
-                        )
-                except Exception as exc:  # noqa: BLE001
-                    _log("字幕下载失败: %s", exc)
-            else:
-                _log("字幕 URL 不在 B 站 CDN 上，拒绝: %s", url[:60])
+            chosen = _pick_subtitle(rows)
+            if chosen:
+                url = _absolute(str(chosen.get("subtitle_url") or ""))
+                if _is_subtitle_cdn(url):
+                    try:
+                        resp = await client.get(url)
+                        if len(resp.content) > MAX_TRANSCRIPT_BYTES * 2:
+                            _log("字幕体积超限，忽略")
+                        else:
+                            resp.raise_for_status()
+                            payload = resp.json()
+                            body = (
+                                payload.get("body")
+                                if isinstance(payload, dict)
+                                and isinstance(payload.get("body"), list)
+                                else []
+                            )
+                            segments = build_transcript_segments(_norm(body))
+                            _log(
+                                "已取到字幕 lan=%s 条数=%d",
+                                chosen.get("lan"),
+                                len(segments),
+                            )
+                    except Exception as exc:  # noqa: BLE001
+                        _log("字幕下载失败: %s", exc)
+                else:
+                    _log("字幕 URL 不在 B 站 CDN 上，拒绝: %s", url[:60])
 
     return BilibiliMedia(
         title=title,
