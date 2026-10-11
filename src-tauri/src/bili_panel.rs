@@ -59,12 +59,38 @@ const PANEL_JS: &str = r##"
     return null;
   }
 
-  function invoke(cmd, args) {
+  function invokeTauri(cmd, args) {
     var internals = window.__TAURI_INTERNALS__;
     if (!internals || typeof internals.invoke !== 'function') {
       return Promise.reject(new Error('Tauri IPC 不可用'));
     }
     return internals.invoke(cmd, args || {});
+  }
+
+  // ---- 搜索：优先同源 fetch，IPC 只作兜底----
+  //
+  // ★ 为什么不用 Tauri IPC 走主路：主窗口一开始是本地页，后端就绪后前端
+  //   location.replace 到 http://127.0.0.1:<web_port> —— 这时它对 Tauri 是
+  //   **远程来源**。Tauri 2 的 capability 若没有 `remote.urls` 声明，
+  //   对远程来源一律不生效，于是每条命令都被 ACL 拒：
+  //   `Command bili_search not allowed by ACL`（v0.2.13 实测）。
+  //   同源 fetch 走的是 HTTP，完全不经过 IPC 层，因此不受 capability 影响。
+  //   顺带好处：面板不依赖任何 Rust 命令，换前端落点也能用。
+  var SEARCH_API = '/api/video-learning/bilibili/search';
+  function search(term, page) {
+    var url = SEARCH_API + '?q=' + encodeURIComponent(term)
+                       + '&page=' + encodeURIComponent(page);
+    if (typeof fetch !== 'function') {
+      return invokeTauri('bili_search', { keyword: term, page: page });
+    }
+    return fetch(url, { credentials: 'same-origin', cache: 'no-store' })
+      .then(function (r) {
+        if (!r.ok) { throw new Error('HTTP ' + r.status); }
+        return r.json();
+      })
+      .catch(function () {
+        return invokeTauri('bili_search', { keyword: term, page: page });
+      });
   }
 
   // ---- React 受控组件的 value 写入法----
@@ -157,7 +183,7 @@ const PANEL_JS: &str = r##"
       list.textContent = '';
       go.disabled = true;
       try {
-        var r = await invoke('bili_search', { keyword: term, page: 1 });
+        var r = await search(term, 1);
         go.disabled = false;
         var items = (r && r.results) || [];
         if (!items.length) {
@@ -498,14 +524,40 @@ fn injection_is_periodic_not_one_shot() {
     );
 }
 
-/// 面板要能调 `bili_search`，所以主窗口必须在 capability 的 windows 里。
+/// ★ 搜索必须**优先走同源 fetch**，不能把 Tauri IPC 当主路。
+///
+/// 主窗口在后端就绪后会 `location.replace` 到 `http://127.0.0.1:<web_port>`，
+/// 对 Tauri 而言变成**远程来源**；而 `capabilities/main.json` 没有 `remote.urls`
+/// 声明，于是每条 IPC 命令都被 ACL 拒 —— v0.2.13 实测报
+/// `Command bili_search not allowed by ACL`（面板能弹、搜索必失败）。
+#[test]
+    fn search_uses_same_origin_fetch_first() {
+        assert!(
+            PANEL_JS.contains("/api/video-learning/bilibili/search"),
+            "面板应直接打后端已挂的同源端点"
+        );
+        assert!(
+            PANEL_JS.contains("credentials: 'same-origin'"),
+            "同源 fetch 要显式带 cookie，否则鉴权失败"
+        );
+        // fetch 必须是 `search()` 的返回主路；IPC 只在它失败时兜底。
+        let primary = PANEL_JS
+            .find("return fetch(url")
+            .expect("search() 应以 fetch 为主路返回");
+        assert!(
+            PANEL_JS[primary..].contains("invokeTauri('bili_search'"),
+            "fetch 之后要有 IPC 兜底（fetch 失败时仍能搜）"
+        );
+    }
+
+    /// IPC 兜底要能工作，主窗口仍须在 capability 的 windows 里。
     #[test]
     fn main_window_may_invoke_bili_search() {
         let caps = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("capabilities/main.json");
         let text = std::fs::read_to_string(&caps).expect("capabilities/main.json 应存在");
         assert!(
             text.contains("\"main\""),
-            "主窗口不在 capability 的 windows 里 → 注入脚本调不到 bili_search"
+            "主窗口不在 capability 的 windows 里 → IPC 兜底也用不了"
         );
     }
 }
