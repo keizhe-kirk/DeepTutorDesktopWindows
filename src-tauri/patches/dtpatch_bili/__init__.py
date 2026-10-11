@@ -230,12 +230,14 @@ def _is_subtitle_cdn(url: str) -> bool:
 # 2026-10-11 真机踩坑：导入 B 站视频时 ``/x/web-interface/view`` 连续 5 次
 # ``code=-412``（13:36:37~13:37:43，用户在连点「重试」），ban 窗口约 9 分钟。
 # 而同一时刻**匿名单发/6 连发/带登录态都复现不出来** —— 说明 -412 是
-# **临时速率风控**：触发靠「请求密集」，解法与 search.py 一致（节流 + 指纹
-# + 退避），另加一道**串行锁**杜绝连点重试造成的并发风暴。
+# **临时速率风控**：触发靠「请求密集」，解法是节流 + 指纹 + 串行锁。
+#
+# 同日二次踩坑（v0.2.16 → v0.2.17）：加了「4/8/16s 退避重试」后**照样
+# -412**，且首发即被拦 —— 退避间隔远短于 9 分钟 ban 窗口，用户每点一次
+# 「重试」就再打一轮（1+3 发），**只会延长封禁**。结论：命中 -412 必须
+# **熔断**（与 :mod:`.search` 共享 ``breaker``），窗口内本地 fail-fast，
+# 一个包都不发给 B 站；文案带剩余秒数，别再引导用户狂点。
 # --------------------------------------------------------------------------
-
-#: 命中 -412 时的退避序列（秒），与 :mod:`.search` 保持一致。
-_RISK_BACKOFF = (4.0, 8.0, 16.0)
 
 #: 匿名设备指纹缓存（``finger/spi`` 的 ``b_3``，即 ``buvid3``）。
 #: 没有登录态时缺 ``buvid3`` 的请求更容易被风控（search.py 实测结论）。
@@ -265,44 +267,46 @@ def _gate() -> Any:
 
 
 async def _api_call(client: Any, path: str, params: dict[str, Any]) -> dict[str, Any]:
-    """打一个 B 站 Web API，带节流与 -412 指数退避。
+    """打一个 B 站 Web API，带节流与 -412 熔断。
 
-    ★ 节流器与搜索**共享**（``search._throttle``）：B 站的风控按客户端
-    整体速率算，搜索与解析互相让速才是正确姿势。
+    ★ 节流器与熔断器与搜索**共享**（``search._throttle`` / ``search.breaker``）：
+    B 站的风控按客户端整体速率算，搜索与解析互相让速才是正确姿势。
+    ★★ 命中 -412 **立即熔断、不重试**：B 站 ban 窗口约 9 分钟，任何
+    「几分钟内再试」的重试都只是延长封禁（v0.2.16 真机教训）。
     """
 
-    from .search import _throttle
+    from .search import _throttle, breaker
 
-    for attempt in range(len(_RISK_BACKOFF) + 1):
-        await _throttle.wait()
-        resp = await client.get(f"{_API}{path}", params=params)
-        try:
-            data = resp.json()
-        except ValueError:
-            raise RuntimeError(
-                f"Bilibili 接口 {path} 返回了非 JSON 响应（HTTP {resp.status_code}）"
-            ) from None
-        code = data.get("code") if isinstance(data, dict) else None
-        if code == 0:
-            payload = data.get("data")
-            return payload if isinstance(payload, dict) else {}
-        if code == -412:
-            if attempt < len(_RISK_BACKOFF):
-                delay = _RISK_BACKOFF[attempt]
-                _log(
-                    "B 站风控 -412（%s），%.0fs 后重试（第 %d 次）",
-                    path,
-                    delay,
-                    attempt + 1,
-                )
-                _throttle.widen(delay)
-                await asyncio.sleep(delay)
-                continue
-            raise RuntimeError(
-                "B 站风控拦截了请求（-412）：请求过于频繁。"
-                "请等 1~2 分钟再点重试，连续快速重试会延长拦截时间"
-            )
-        raise RuntimeError(f"Bilibili 接口 {path} 返回 code={code}")
+    left = breaker.remaining()
+    if left > 0:
+        raise RuntimeError(
+            f"B 站风控拦截中，请等约 {int(left) + 1} 秒后再试"
+            "（现在点重试只会延长拦截时间）"
+        )
+
+    await _throttle.wait()
+    resp = await client.get(f"{_API}{path}", params=params)
+    try:
+        data = resp.json()
+    except ValueError:
+        raise RuntimeError(
+            f"Bilibili 接口 {path} 返回了非 JSON 响应（HTTP {resp.status_code}）"
+        ) from None
+    code = data.get("code") if isinstance(data, dict) else None
+    if code == 0:
+        breaker.reset()
+        payload = data.get("data")
+        return payload if isinstance(payload, dict) else {}
+    if code == -412:
+        window = breaker.trip()
+        _throttle.widen(5.0)
+        _log("B 站风控 -412（%s），熔断 %.0fs（此间不再发任何请求）", path, window)
+        raise RuntimeError(
+            f"B 站风控拦截了请求（-412）：请求过于频繁。"
+            f"已暂停请求约 {int(window)} 秒，请等倒计时结束再点重试，"
+            "连续快速重试会延长拦截时间"
+        )
+    raise RuntimeError(f"Bilibili 接口 {path} 返回 code={code}")
 
 
 async def _ensure_buvid3(client: Any, cookies: dict[str, str]) -> None:
@@ -367,6 +371,16 @@ async def _fetch_bilibili_media(request: Any, languages: Any) -> BilibiliMedia:
     # ★ 串行锁：连点「重试」/并发导入时，同一时间只有一个解析在打 B 站
     #   —— 并发请求正是 -412 风控的直接诱因（2026-10-11 真机踩坑）。
     async with _gate():
+        # ★★ 熔断窗口内连 client 都不建：发往 B 站的任何请求（含
+        #   finger/spi）都会延长封禁，必须本地 fail-fast。
+        from .search import breaker as _breaker
+
+        _left = _breaker.remaining()
+        if _left > 0:
+            raise RuntimeError(
+                f"B 站风控拦截中，请等约 {int(_left) + 1} 秒后再试"
+                "（现在点重试只会延长拦截时间）"
+            )
         async with httpx.AsyncClient(
             timeout=15, follow_redirects=True, headers=headers
         ) as client:
@@ -402,6 +416,10 @@ async def _fetch_bilibili_media(request: Any, languages: Any) -> BilibiliMedia:
                     client, "/x/player/wbi/v2", {"bvid": request.bvid, "cid": cid}
                 )
             except Exception as exc:  # noqa: BLE001 - 字幕失败不该拖垮整条链路
+                if _breaker.remaining() > 0:
+                    # 风控熔断中：别把「无字幕的残次导入」当成功落库，
+                    # 整体失败让用户等窗口过了重试，字幕才补得回来。
+                    raise
                 _log("播放器接口不可用（%s），仅返回元数据", exc)
                 player = {}
 

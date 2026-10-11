@@ -32,8 +32,15 @@ from typing import Any
 #: 匿名配额比单个请求严格得多，所以这里取 3.0s 并在命中 -412 时指数退避。
 MIN_INTERVAL = 3.0
 
-#: 命中 -412 时的退避序列（秒）。逐级变长，最后一次放弃并如实报错。
-BACKOFF = (4.0, 8.0, 16.0)
+#: 命中 -412 后的熔断窗口（秒）。
+#:
+#: v0.2.16 的「4/8/16s 退避重试」被真机二次证伪（2026-10-11）：B 站 ban
+#: 窗口实测约 9 分钟，退避间隔远短于窗口，用户每点一次「重试」就再打一轮
+#: 请求，**只会延长封禁**。正确姿势是**熔断**：命中即记下截止时间，窗口内
+#: 所有请求本地 fail-fast，一个包都不发给 B 站。窗口随连续命中翻倍，
+#: 封顶 :data:`BAN_WINDOW_MAX`（≈B 站真实 ban 窗口）。
+BAN_WINDOW = 120.0
+BAN_WINDOW_MAX = 600.0
 
 #: 单次搜索最多取多少条 —— 够填一屏，又不至于把风控额度一次耗光。
 MAX_RESULTS = 20
@@ -78,6 +85,41 @@ class _Throttle:
 
 
 _throttle = _Throttle()
+
+
+class _Breaker:
+    """进程级 -412 熔断器，搜索与视频解析**共享**同一个实例。
+
+    命中 -412 就 :meth:`trip` 记下截止时间；窗口内 :meth:`remaining` > 0，
+    所有打 B 站的调用方都必须先查它并本地 fail-fast。成功一次 :meth:`reset`
+    清零升级计数。
+    """
+
+    def __init__(self) -> None:
+        self._until = 0.0
+        self._hits = 0
+
+    def trip(self) -> float:
+        """记一次 -412，返回本次熔断窗口秒数（连续命中逐次翻倍）。"""
+
+        self._hits += 1
+        window = min(BAN_WINDOW * (2 ** (self._hits - 1)), BAN_WINDOW_MAX)
+        self._until = time.monotonic() + window
+        return window
+
+    def remaining(self) -> float:
+        """熔断窗口剩余秒数；0 表示可以放行。"""
+
+        return max(0.0, self._until - time.monotonic())
+
+    def reset(self) -> None:
+        """请求成功过 → 解除升级计数（窗口本身到期即自然放行）。"""
+
+        self._until = 0.0
+        self._hits = 0
+
+
+breaker = _Breaker()
 
 
 def _strip_html(value: Any) -> str:
@@ -180,36 +222,42 @@ async def search(
         jar = cred.load_cookies()
 
     page = max(1, int(page or 1))
-    code, payload = -1, {"message": ""}
 
-    # Attempt 0 is the normal path; extra attempts only exist for -412.
-    for attempt in range(len(BACKOFF) + 1):
-        await _throttle.wait()
-        try:
-            code, payload = await _once(httpx, term, page, jar)
-        except Exception as exc:  # noqa: BLE001
-            return {
-                "results": [],
-                "error": f"搜索请求失败：{type(exc).__name__}",
-                "keyword": term,
-                "page": page,
-            }
-        if code != -412:
-            break
-        if attempt < len(BACKOFF):
-            delay = BACKOFF[attempt]
-            _warn(f"命中 -412 风控，{delay:.0f}s 后重试（第 {attempt + 1} 次）")
-            # Widen the global interval too: a hot client should slow down for
-            # everyone, not just this call.
-            _throttle.widen(delay)
-
-    if code == -412:
+    # 熔断窗口内 fail-fast：一个请求都不发，免得延长封禁。
+    left = breaker.remaining()
+    if left > 0:
         return {
             "results": [],
-            "error": "触发了 B 站风控（-412），请稍后再试",
+            "error": f"B 站风控拦截中，请等约 {int(left) + 1} 秒后再试",
             "keyword": term,
             "page": page,
         }
+
+    await _throttle.wait()
+    try:
+        code, payload = await _once(httpx, term, page, jar)
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "results": [],
+            "error": f"搜索请求失败：{type(exc).__name__}",
+            "keyword": term,
+            "page": page,
+        }
+
+    if code == -412:
+        # 命中即熔断，**不重试**（v0.2.16 的退避重试真机证伪：4/8/16s
+        # 远短于 ban 窗口，重试只是继续喂风控、延长封禁）。
+        window = breaker.trip()
+        _throttle.widen(5.0)
+        _warn(f"命中 -412 风控，熔断 {window:.0f}s（此间不再发任何请求）")
+        return {
+            "results": [],
+            "error": f"触发了 B 站风控（-412），请等约 {int(window)} 秒后再试",
+            "keyword": term,
+            "page": page,
+        }
+    if code == 0:
+        breaker.reset()
     if code != 0:
         return {
             "results": [],
