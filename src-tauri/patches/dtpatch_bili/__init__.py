@@ -382,7 +382,13 @@ async def _fetch_bilibili_media(request: Any, languages: Any) -> BilibiliMedia:
                 "（现在点重试只会延长拦截时间）"
             )
         async with httpx.AsyncClient(
-            timeout=15, follow_redirects=True, headers=headers
+            timeout=15,
+            follow_redirects=True,
+            headers=headers,
+            # ★ trust_env=False：B 站 API/字幕 CDN 都是国内服务，永远直连。
+            # 走系统代理会撞失效端口 ConnectError，出口 IP 飘海外还会加码
+            # 风控（2026-10-12 实测：代理隧道 TLS 失败 + -412 交替出现）。
+            trust_env=False,
         ) as client:
             # 匿名时补一个设备指纹，降低 -412 概率（登录态自带 buvid3）。
             await _ensure_buvid3(client, cookies)

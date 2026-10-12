@@ -184,6 +184,9 @@ async def _once(
     async with httpx_mod.AsyncClient(
         timeout=12.0,
         follow_redirects=False,
+        # ★ trust_env=False：B 站是国内服务，永远直连。走系统代理（Clash 等）
+        # 会撞失效端口 ConnectError，出口 IP 飘海外还会加码风控（2026-10-12 实测）。
+        trust_env=False,
         headers={"User-Agent": _UA, "Referer": _REFERER, "Accept": "application/json"},
         cookies=jar or None,
     ) as client:
@@ -237,9 +240,15 @@ async def search(
     try:
         code, payload = await _once(httpx, term, page, jar)
     except Exception as exc:  # noqa: BLE001
+        # 连接类异常给可读文案（裸 ConnectError 用户看不懂）；其余保留原名。
+        name = type(exc).__name__
+        if "Connect" in name or "Timeout" in name or "timeout" in name:
+            error = "网络连接失败，请检查网络后重试"
+        else:
+            error = f"搜索请求失败：{name}"
         return {
             "results": [],
-            "error": f"搜索请求失败：{type(exc).__name__}",
+            "error": error,
             "keyword": term,
             "page": page,
         }
