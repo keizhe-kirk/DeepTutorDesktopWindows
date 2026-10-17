@@ -66,8 +66,12 @@ windows = { version = "0.61", features = [
 ] }
 
 [features]
-# 默认关闭自定义协议需要时启用
 default = []
+# this feature is used for production builds or when a dev server is not specified, DO NOT REMOVE!!
+# 本地自测要用 `cargo build --features custom-protocol` —— 不带这个特性就是 dev 模式,
+# webview 会去加载 devUrl(见 tauri.conf.json),谁在听那个端口就渲染谁(踩过:撞上
+# Folio 的 vite dev server,DeepTutor 窗口里冒出另一个 App 的界面)。
+custom-protocol = ["tauri/custom-protocol"]
 
 [profile.release]
 panic = "abort"

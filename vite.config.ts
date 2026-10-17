@@ -10,10 +10,10 @@ export default defineConfig(async () => ({
   plugins: [react()],
   clearScreen: false,
   server: {
-    port: 1420,
+    port: 1423,
     strictPort: true,
     host: false,
-    hmr: { protocol: 'ws', host: 'localhost', port: 1421 },
+    hmr: { protocol: 'ws', host: 'localhost', port: 1424 },
     watch: { ignored: ['**/src-tauri/**'] }
   },
   envPrefix: ['VITE_', 'TAURI_'],
