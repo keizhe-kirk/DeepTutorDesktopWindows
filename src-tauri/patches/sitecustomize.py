@@ -80,6 +80,11 @@ class _VideoLearningPatch:
                     # ★ 必须在 include_router 之前完成 —— router 模块 import 完
                     # 就立刻注册,那时app 还没遍历它的 routes。
                     bili_router.install(module)
+                    # 复习卡闭环（#1）：包标记路由 + 挂 review 端点。
+                    # 同样赶在 include_router 之前；失败不影响上面已挂的。
+                    from dtpatch_bili import review as bili_review
+
+                    bili_review.install(module)
                 else:
                     # reading 路由不新增端点，只是把 _ingestion() 换成注入我们
                     # loader 的版本，因此没有 include_router 那条时序约束。
