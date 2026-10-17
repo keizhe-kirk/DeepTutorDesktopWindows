@@ -94,6 +94,11 @@ class _VideoLearningPatch:
                     from dtpatch_bili import heat as bili_heat
 
                     bili_heat.install(module)
+                    # 合集/分P 追更 + 课程进度（#6）：课程结构端点。同样是
+                    # 一个 GET + 永远 200 降级，与上面两个并列装完。
+                    from dtpatch_bili import series as bili_series
+
+                    bili_series.install(module)
                 else:
                     # reading 路由：换 _ingestion() 注入我们的 loader；同时包
                     # annotations 路由把标记同步成复习卡（1.6.14 播放页的

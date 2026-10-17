@@ -110,9 +110,17 @@ const PANEL_JS: &str = r##"
     return !!j.material_id && !!((cues && cues.length) || (segs && segs.length));
   }
 
+  // 材料详情（manifest）：material_id + source_url + duration_seconds。
+  // #6 的进度跟踪靠它拿「当前看的是哪个 URL」—— 页面自己就会拉这份，
+  // 顺手记下来，省得每个材料再补一次请求。
+  function looksLikeDetail(j) {
+    return !!j && typeof j === 'object' && !!j.material_id
+        && typeof j.source_url === 'string' && !!j.source_url;
+  }
+
   function installRecorder() {
     if (window[SUB_RECORDER]) { return; }
-    window[SUB_RECORDER] = { material: null, lastSeek: 0 };
+    window[SUB_RECORDER] = { material: null, detail: null, lastSeek: 0 };
     var orig = window.fetch;
     if (typeof orig !== 'function') { return; }
     window.fetch = function () {
@@ -127,6 +135,7 @@ const PANEL_JS: &str = r##"
             try {
               resp.clone().json().then(function (j) {
                 if (looksLikeMaterial(j)) { window[SUB_RECORDER].material = j; }
+                else if (looksLikeDetail(j)) { window[SUB_RECORDER].detail = j; }
               }, function () {});
             } catch (e) {}
           }, function () {});
@@ -364,6 +373,8 @@ const PANEL_JS: &str = r##"
       url.searchParams.set('t', String(Math.max(0, Math.floor(seconds))));
       frame.src = url.toString();
       if (window[SUB_RECORDER]) { window[SUB_RECORDER].lastSeek = seconds; }
+      // 进度跟踪（#6）：seek 即重新定位， elapsed 从这一刻起算
+      if (progress.key) { progress.seek = seconds; progress.at = Date.now(); }
       return true;
     } catch (e) { return false; }
   }
@@ -1023,6 +1034,374 @@ const PANEL_JS: &str = r##"
     }
   }
 
+  // ---- 课程（#6）：分P/合集清单 + 追更进度 ----
+  //
+  // ★ 数据从哪来：后端 GET /bilibili/materials/{id}/series 返回分P清单或
+  //   合集剧集（导入时 loader 已把 view 的结构写进 provider_cache；老材料
+  //   后端打一次 view 补取并写回）。永远 200，失败走 body.error。
+  // ★ 切换一集为什么走导入而不是改 iframe src：字幕/标记/复习卡全挂在
+  //   material 上，换 P 就是换材料。URL 带 ?p=N，material_id 由 URL 哈希
+  //   决定（上游 url_material_id），重复导入同一集落同一个材料、不会
+  //   duplication。流程：POST /api/reading/library/import-urls（带当前
+  //   workspace_id 落进本工作区）→ PUT .../materials/{id}/active →
+  //   硬导航 /learning/reading/{workspace_id}（页面按 active_material_id
+  //   选材料，实测）。
+  // ★ 进度为什么存 localStorage：B 站 iframe 不上报播放进度（2026-10-17
+  //   headless 探针实测只发一条 REQUEST_PARENT_TITLE），只能用 t= 参数
+  //   近似 + 经过时间估算。key 用 URL 解析出的 bvid.p{N}（P1 记成 bvid
+  //   本身，与上游 canonical URL 去掉 p=1 的行为对齐），不跟 material_id
+  //   绑 —— 同一集导入多少次都是同一个 key。
+  var SERIES_API = '/api/video-learning/bilibili/materials/';
+  var IMPORT_API = '/api/reading/library/import-urls';
+  var PROGRESS_PREFIX = 'dtbili.progress.';
+  var PENDING_SEEK_KEY = 'dtbili.pendingSeek';
+  var courseOverlay = null;
+  var courseStatusEl = null;
+  var courseData = null;
+
+  function courseSeries(mid) {
+    return window.fetch(SERIES_API + encodeURIComponent(mid) + '/series',
+                        { credentials: 'same-origin', cache: 'no-store' })
+      .then(function (r) { return r.json(); });
+  }
+
+  // 当前工作区：沉浸式观看页的 URL 就是 /learning/reading/{workspaceId}
+  function currentWorkspaceId() {
+    var m = /\/learning\/reading\/([^/?#]+)/.exec(location.pathname || '');
+    return m ? decodeURIComponent(m[1]) : '';
+  }
+
+  // ---- 观看进度 ----
+  var progress = { mid: '', bvid: '', key: '', seek: 0, at: 0, dur: 0 };
+  var progressFetchedMid = '';
+
+  // URL → {bvid, key}；key 规则与后端 series 的 item.key 对齐：
+  // p>1 → 'p{N}'，否则 bvid 本身（合集单集 / 分P第 1 集）。
+  function parseBiliUrl(url) {
+    var text = String(url || '');
+    var m = /\/video\/(BV[0-9A-Za-z]+)/i.exec(text);
+    if (!m) { return null; }
+    var bvid = 'BV' + m[1].slice(2);
+    var p = /[?&]p=(\d+)/.exec(text);
+    var page = p ? (Number(p[1]) || 1) : 1;
+    return { bvid: bvid, key: page > 1 ? ('p' + page) : bvid };
+  }
+
+  function readProgress(bvid, key) {
+    if (!bvid || !key) { return 0; }
+    try {
+      var raw = localStorage.getItem(PROGRESS_PREFIX + bvid + '.' + key);
+      if (!raw) { return 0; }
+      var v = JSON.parse(raw);
+      var sec = Number(v && v.sec) || 0;
+      return sec > 0 ? sec : 0;
+    } catch (e) { return 0; }
+  }
+
+  function writeProgress(bvid, key, sec, dur) {
+    if (!bvid || !key || !(sec > 0)) { return; }
+    try {
+      localStorage.setItem(PROGRESS_PREFIX + bvid + '.' + key,
+        JSON.stringify({ sec: Math.round(sec), dur: Math.round(dur || 0), at: Date.now() }));
+    } catch (e) {}
+  }
+
+  // 当前播放位置（秒）：最近一次定位 + 距上次 seek 经过的时间。
+  // t= 参数只在 seek 时变，所以中间那段靠墙上时钟补。
+  function watchedSeconds() {
+    if (!progress.at) { return progress.seek; }
+    return progress.seek + (Date.now() - progress.at) / 1000;
+  }
+
+  function applyProgressTarget(detail) {
+    var parsed = parseBiliUrl(detail && detail.source_url);
+    if (!parsed) { return; }
+    if (progress.mid === detail.material_id && progress.key) { return; }
+    progress.mid = String(detail.material_id || '');
+    progress.bvid = parsed.bvid;
+    progress.key = parsed.key;
+    progress.seek = currentPlayerSeconds();
+    progress.at = Date.now();
+    progress.dur = Number(detail.duration_seconds) || 0;
+  }
+
+  // 材料 URL 哪来的：页面自己拉过的材料详情被记录器收着（detail 槽）；
+  // 没有就自己打一次 GET /api/reading/materials/{id}（每个材料一次）。
+  function ensureProgressTarget(mid) {
+    if (!mid) { return; }
+    var d = window[SUB_RECORDER] && window[SUB_RECORDER].detail;
+    if (d && d.material_id === mid) { applyProgressTarget(d); return; }
+    if (progressFetchedMid === mid) { return; }
+    progressFetchedMid = mid;
+    window.fetch('/api/reading/materials/' + encodeURIComponent(mid),
+                 { credentials: 'same-origin', cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (j) { if (j && j.material_id === mid) { applyProgressTarget(j); } })
+      .catch(function () {});
+  }
+
+  // 「看到哪」按高水位存：重看不会把进度刷回去。
+  function saveProgress() {
+    if (!progress.key) { return; }
+    var sec = watchedSeconds();
+    if (sec < 5) { return; }  // 打开就关，不算看过
+    var best = Math.max(readProgress(progress.bvid, progress.key), sec);
+    writeProgress(progress.bvid, progress.key, best, progress.dur);
+  }
+
+  function tickProgress() {
+    var mid = recordedMaterialId();
+    if (!mid) { return; }
+    ensureProgressTarget(mid);
+    saveProgress();
+  }
+
+  // 续播：切过去之后新材料就位，把 sessionStorage 里的目标位 seek 一次。
+  // sessionStorage 同源硬导航不丢；iframe 没出现（材料还在处理）就等下个
+  // tick，seek 成功才撤标记，绝不半路 seek 到旧视频上。
+  function checkPendingSeek() {
+    var raw = null;
+    try { raw = sessionStorage.getItem(PENDING_SEEK_KEY); } catch (e) { return; }
+    if (!raw) { return; }
+    var want = null;
+    try { want = JSON.parse(raw); } catch (e) { want = null; }
+    if (!want || !want.key) {
+      try { sessionStorage.removeItem(PENDING_SEEK_KEY); } catch (e) {}
+      return;
+    }
+    var mid = recordedMaterialId();
+    if (!mid) { return; }
+    ensureProgressTarget(mid);
+    if (!progress.key) { return; }  // 材料详情还没到，下个 tick 再来
+    if ((progress.bvid + '.' + progress.key) !== want.key) {
+      // 对不上（用户中途去了别的页）：撤标记，避免以后误 seek
+      try { sessionStorage.removeItem(PENDING_SEEK_KEY); } catch (e) {}
+      return;
+    }
+    if (!findBilibiliIframe()) { return; }  // 材料还在处理，等播放器出现
+    try { sessionStorage.removeItem(PENDING_SEEK_KEY); } catch (e) {}
+    seekBilibili(Number(want.sec) || 0);
+    if (courseStatusEl) { courseStatusEl.textContent = '已续播到 ' + fmtClock(Number(want.sec) || 0); }
+  }
+
+  function courseStatus(text) {
+    if (courseStatusEl) { courseStatusEl.textContent = text; }
+  }
+
+  // item → 进度 key（与 tracker 的 key 规则一致：p>1 → p{N}，否则 bvid）
+  function courseItemKey(item, data) {
+    if (!data) { return ''; }
+    if (data.kind === 'season') { return String(item.bvid || item.key || ''); }
+    var page = Number(item.page) || 0;
+    return page > 1 ? ('p' + page) : String(data.bvid || '');
+  }
+
+  function courseRow(item, data) {
+    var isCurrent = !!(data && data.current) && item.key === data.current;
+    var card = document.createElement('div');
+    card.style.cssText = 'padding:8px;margin-bottom:6px;border-radius:8px;'
+      + 'border:1px solid var(--border,#e5e5e5)'
+      + (isCurrent ? ';border-color:var(--primary,#e9544b)' : '');
+    card.onmouseenter = function () { card.style.background = 'var(--muted,#f3f3f3)'; };
+    card.onmouseleave = function () { card.style.background = 'transparent'; };
+
+    var line1 = document.createElement('div');
+    line1.style.cssText = 'display:flex;gap:8px;align-items:baseline';
+    var mark = document.createElement('span');
+    mark.textContent = isCurrent ? '▶' : '';
+    mark.style.cssText = 'flex:none;font-size:11px;color:var(--primary,#e9544b)';
+    var t = document.createElement('div');
+    // ★ B 站标题是用户数据：textContent，不拼 HTML
+    t.textContent = item.title || item.key || '(无标题)';
+    t.style.cssText = 'flex:1;min-width:0;font-size:13px;line-height:1.45;'
+      + 'display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden'
+      + (isCurrent ? ';color:var(--primary,#e9544b);font-weight:500' : '');
+    var dur = document.createElement('span');
+    dur.textContent = fmtClock(item.duration);
+    dur.style.cssText = 'flex:none;font-size:11px;color:var(--muted-foreground,#888);'
+      + 'font-variant-numeric:tabular-nums';
+    line1.appendChild(mark); line1.appendChild(t); line1.appendChild(dur);
+
+    var key = courseItemKey(item, data);
+    var sec = key ? readProgress(data.bvid, key) : 0;
+    var line2 = document.createElement('div');
+    line2.style.cssText = 'display:flex;gap:8px;align-items:center;margin-top:4px';
+    var bar = document.createElement('div');
+    bar.style.cssText = 'flex:1;height:4px;border-radius:2px;'
+      + 'background:var(--border,#e5e5e5);overflow:hidden';
+    var fill = document.createElement('div');
+    var ratio = (Number(item.duration) > 0) ? Math.min(1, sec / Number(item.duration)) : 0;
+    fill.style.cssText = 'height:100%;background:var(--primary,#e9544b)';
+    fill.style.width = (ratio * 100).toFixed(1) + '%';
+    bar.appendChild(fill);
+    var seen = document.createElement('span');
+    seen.textContent = sec > 5
+      ? ('看到 ' + fmtClock(sec) + (item.duration ? (' / ' + fmtClock(item.duration)) : ''))
+      : '未观看';
+    seen.style.cssText = 'flex:none;font-size:11px;color:var(--muted-foreground,#888);'
+      + 'font-variant-numeric:tabular-nums';
+    line2.appendChild(bar); line2.appendChild(seen);
+    if (sec > 30) {
+      var restart = document.createElement('button');
+      restart.type = 'button';
+      restart.textContent = '从头';
+      restart.style.cssText = 'flex:none;font-size:11px;padding:2px 8px;border-radius:6px;'
+        + 'cursor:pointer;border:1px solid var(--border,#e5e5e5);background:transparent;'
+        + 'color:inherit';
+      restart.onclick = function (e) {
+        if (e && e.stopPropagation) { e.stopPropagation(); }
+        switchToItem(item, data, true);
+      };
+      line2.appendChild(restart);
+    }
+
+    card.appendChild(line1); card.appendChild(line2);
+    card.onclick = function () { switchToItem(item, data, false); };
+    return card;
+  }
+
+  function switchToItem(item, data, restart) {
+    var mid = recordedMaterialId();
+    if (!mid) {
+      courseStatus('还没拿到视频材料 —— 先打开这个视频的播放页再试');
+      return;
+    }
+    var url = String(item.url || '');
+    if (!url) { courseStatus('这一集没有可跳转的链接'); return; }
+    var ws = currentWorkspaceId();
+    courseStatus('正在切换到「' + (item.title || item.key) + '」…');
+    window.fetch(IMPORT_API, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'same-origin',
+      body: JSON.stringify({
+        urls: [url],
+        workspace_id: ws,
+        workspace_title: (data && data.title) || ''
+      })
+    }).then(function (r) {
+      return r.json().then(function (j) { return { ok: r.ok, status: r.status, body: j || {} }; },
+                           function () { return { ok: false, status: r.status, body: { error: '响应不是 JSON' } }; });
+    }).then(function (res) {
+      var rows = (res.body && res.body.materials) || [];
+      var newMid = rows.length ? String(rows[0].material_id || '') : '';
+      var targetWs = (res.body && res.body.workspace && res.body.workspace.workspace_id) || ws;
+      if (!res.ok || !newMid || !targetWs) {
+        courseStatus('切换失败：' + ((res.body && res.body.error) || ('HTTP ' + res.status)));
+        return null;
+      }
+      // 续播位（点了「从头」就不记）
+      if (!restart) {
+        var key = courseItemKey(item, data);
+        var sec = key ? readProgress(data.bvid, key) : 0;
+        if (sec > 30) {
+          try {
+            sessionStorage.setItem(PENDING_SEEK_KEY,
+              JSON.stringify({ key: data.bvid + '.' + key, sec: Math.round(sec) }));
+          } catch (e) {}
+        }
+      }
+      return window.fetch('/api/reading/workspaces/' + encodeURIComponent(targetWs)
+                          + '/materials/' + encodeURIComponent(newMid) + '/active',
+                          { method: 'PUT', credentials: 'same-origin' })
+        .then(function (r2) {
+          if (!r2.ok) { throw new Error('激活材料失败 HTTP ' + r2.status); }
+        })
+        .then(function () {
+          courseStatus('已切入，正在打开…');
+          location.assign('/learning/reading/' + encodeURIComponent(targetWs));
+          return null;
+        });
+    }).catch(function (e) {
+      courseStatus('切换出错：' + ((e && e.message) || e) + '（可重试，不影响播放）');
+    });
+  }
+
+  function ensureCourseOverlay() {
+    if (courseOverlay && document.body.contains(courseOverlay)) { return courseOverlay; }
+    courseOverlay = document.createElement('div');
+    courseOverlay.style.cssText = 'position:fixed;inset:0;z-index:2147483000;display:none;'
+      + 'align-items:center;justify-content:center;background:rgba(0,0,0,.45)';
+
+    var panel = document.createElement('div');
+    panel.style.cssText = 'width:min(680px,92vw);max-height:82vh;display:flex;flex-direction:column;'
+      + 'background:var(--card,#fff);color:var(--foreground,#111);border-radius:12px;'
+      + 'box-shadow:0 18px 50px rgba(0,0,0,.28);overflow:hidden';
+
+    var head = document.createElement('div');
+    head.style.cssText = 'display:flex;align-items:center;gap:8px;padding:12px 14px;'
+      + 'border-bottom:1px solid var(--border,#e5e5e5)';
+    var title = document.createElement('div');
+    title.textContent = '课程';
+    title.style.cssText = 'font-size:14px;font-weight:500;flex:1';
+    var close = document.createElement('button');
+    close.type = 'button';
+    close.textContent = '关闭';
+    close.style.cssText = 'font-size:12px;padding:4px 10px;border-radius:6px;cursor:pointer;'
+      + 'border:1px solid var(--border,#e5e5e5);background:transparent;color:inherit';
+    close.onclick = function () { courseOverlay.style.display = 'none'; };
+    head.appendChild(title); head.appendChild(close);
+
+    // 顶栏：刷新 + 说明（进度只存本机）
+    var row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:8px;align-items:center;padding:12px 14px 0';
+    var reload = aiStyleButton('刷新');
+    var hint = document.createElement('span');
+    hint.style.cssText = 'font-size:12px;color:var(--muted-foreground,#888)';
+    hint.textContent = '点一集切过去 · 进度只存在本机浏览器';
+    row.appendChild(reload); row.appendChild(hint);
+
+    var status = document.createElement('div');
+    status.style.cssText = 'padding:10px 14px 4px;font-size:12px;color:var(--muted-foreground,#888);min-height:18px';
+    var list = document.createElement('div');
+    list.style.cssText = 'flex:1;overflow:auto;padding:0 8px 12px';
+
+    panel.appendChild(head); panel.appendChild(row); panel.appendChild(status); panel.appendChild(list);
+    courseOverlay.appendChild(panel);
+    document.body.appendChild(courseOverlay);
+    courseOverlay.addEventListener('click', function (e) {
+      if (e.target === courseOverlay) { courseOverlay.style.display = 'none'; }
+    });
+
+    courseStatusEl = status;
+
+    function refresh() {
+      var mid = recordedMaterialId();
+      courseData = null;
+      list.textContent = '';
+      if (!mid) {
+        status.textContent = '还没拿到视频材料 —— 先打开这个视频的播放页再试';
+        return;
+      }
+      status.textContent = '正在读取课程结构…';
+      courseSeries(mid).then(function (j) {
+        courseData = j || {};
+        var items = (j && j.items) || [];
+        if (!items.length) {
+          status.textContent = (j && j.error) || '这个视频没有分P或合集信息';
+          return;
+        }
+        var kindLabel = j.kind === 'season' ? '合集' : '分P';
+        status.textContent = kindLabel + ' · 共 ' + items.length + ' 集'
+          + (j.title ? (' · ' + j.title) : '');
+        list.textContent = '';
+        items.forEach(function (item) { list.appendChild(courseRow(item, j)); });
+      }).catch(function () {
+        status.textContent = '课程结构读取失败（不影响播放）';
+      });
+    }
+
+    reload.onclick = refresh;
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && courseOverlay && courseOverlay.style.display !== 'none') {
+        courseOverlay.style.display = 'none';
+      }
+    });
+
+    courseOverlay.__dtCourseRefresh = refresh;
+    return courseOverlay;
+  }
+
   // ---- 装按钮 ----
   function install() {
     var input = findAnchorInput();
@@ -1091,6 +1470,21 @@ const PANEL_JS: &str = r##"
     };
     (ai.parentElement || ai).insertBefore(hot, ai.nextSibling);
 
+    // 课程按钮（#6）：分P/合集清单 + 「第几课看到哪」。取不到时面板给
+    // 明确提示，不影响播放。
+    var course = document.createElement('button');
+    course.type = 'button';
+    course.textContent = '课程';
+    course.style.cssText = 'margin-left:8px;height:34px;padding:0 12px;font-size:13px;cursor:pointer;'
+      + 'border-radius:8px;border:1px solid var(--border,#e5e5e5);'
+      + 'background:transparent;color:var(--foreground,inherit)';
+    course.onclick = function () {
+      var ov = ensureCourseOverlay();
+      ov.style.display = 'flex';
+      if (ov.__dtCourseRefresh) { ov.__dtCourseRefresh(); }
+    };
+    (hot.parentElement || hot).insertBefore(course, hot.nextSibling);
+
     log('button installed');
     return true;
   }
@@ -1103,9 +1497,16 @@ const PANEL_JS: &str = r##"
     try {
       ensureHeatBar();
       window.setInterval(ensureHeatBar, 1000);
+      window.setInterval(checkPendingSeek, 1000);
       window.addEventListener('scroll', ensureHeatBar, true);
       window.addEventListener('resize', ensureHeatBar);
     } catch (e) { log('heat bar boot failed: ' + e); }
+    // 观看进度（#6）：5s 一存 + 离开页面补存一次。iframe 不上报进度，
+    // 估算值靠 tick 推进；存的是高水位，重看不刷回去。
+    try {
+      window.setInterval(tickProgress, 5000);
+      window.addEventListener('pagehide', saveProgress);
+    } catch (e) { log('progress boot failed: ' + e); }
     if (install()) { return; }
     var mo = new MutationObserver(function () {
       if (install()) { mo.disconnect(); }
@@ -1593,6 +1994,121 @@ fn injection_is_periodic_not_one_shot() {
         assert!(
             PANEL_JS.contains("payload.context = context"),
             "热评语料要进 payload.context 字段"
+        );
+    }
+
+    /// ★ #6 课程面板：结构必须来自后端 series 端点（同源 fetch），
+    /// 失败永远 200 + body.error，前端只画列表。
+    #[test]
+    fn course_panel_uses_series_endpoint() {
+        assert!(
+            PANEL_JS.contains("'/series'"),
+            "课程结构要打后端 /series 端点"
+        );
+        assert!(
+            PANEL_JS.contains("credentials: 'same-origin'"),
+            "同源 fetch 要显式带 cookie，否则鉴权失败"
+        );
+        assert!(
+            PANEL_JS.contains("这个视频没有分P或合集信息"),
+            "无结构时要给可读提示，不能静默无结果"
+        );
+    }
+
+    /// 切换一集必须走「导入 → 激活 → 硬导航」三步，且带当前 workspace_id
+    /// （落进本工作区而不是新开一个）。
+    #[test]
+    fn course_switch_flow_imports_then_activates_then_navigates() {
+        assert!(
+            PANEL_JS.contains("/api/reading/library/import-urls"),
+            "切换要走 reading 的导入端点"
+        );
+        assert!(
+            PANEL_JS.contains("/materials/' + encodeURIComponent(newMid) + '/active'"),
+            "导入后要 PUT active 激活新材料（页面按 active_material_id 选材料）"
+        );
+        assert!(
+            PANEL_JS.contains("location.assign('/learning/reading/'"),
+            "最后要硬导航到阅读页（SPA 状态不会自己认识新材料）"
+        );
+        assert!(
+            PANEL_JS.contains("workspace_id: ws"),
+            "导入要带当前工作区 id，否则每切一集新开一个工作区"
+        );
+        assert!(
+            PANEL_JS.contains("currentWorkspaceId"),
+            "要从 URL 解析当前工作区"
+        );
+        assert!(
+            PANEL_JS.contains("method: 'PUT'"),
+            "激活材料是 PUT"
+        );
+    }
+
+    /// 进度存 localStorage、key 按 URL 解析（不跟 material_id 绑），
+    /// 高水位存（重看不刷回去），续播位走 sessionStorage。
+    #[test]
+    fn course_progress_is_local_and_keyed_by_url() {
+        assert!(
+            PANEL_JS.contains("dtbili.progress."),
+            "进度要存 localStorage（B 站 iframe 不上报进度，只能前端估算）"
+        );
+        assert!(
+            PANEL_JS.contains("function parseBiliUrl"),
+            "要能从材料 URL 解析 bvid + 分P 号"
+        );
+        assert!(
+            PANEL_JS.contains("function watchedSeconds"),
+            "位置 = 最近定位 + 经过时间（t= 参数只在 seek 时变）"
+        );
+        assert!(
+            PANEL_JS.contains("Math.max(readProgress"),
+            "进度按高水位存：重看不会把进度刷回去"
+        );
+        assert!(
+            PANEL_JS.contains("dtbili.pendingSeek"),
+            "续播位走 sessionStorage（同源硬导航不丢）"
+        );
+        assert!(
+            PANEL_JS.contains("function checkPendingSeek"),
+            "导航后要检查并执行待定的续播 seek"
+        );
+    }
+
+    /// 续播 seek 必须等新材料 + iframe 都就位才执行，且只 seek 一次 ——
+    /// 半路 seek 会把旧视频跳到奇怪的位置。
+    #[test]
+    fn course_pending_seek_waits_for_new_material() {
+        assert!(
+            PANEL_JS.contains("if (!findBilibiliIframe()) { return; }"),
+            "iframe 没出现（材料还在处理）就等下一个 tick"
+        );
+        assert!(
+            PANEL_JS.contains("if ((progress.bvid + '.' + progress.key) !== want.key)"),
+            "材料对不上就撤标记，绝不误 seek"
+        );
+        assert!(
+            PANEL_JS.contains("sessionStorage.removeItem(PENDING_SEEK_KEY)"),
+            "seek 成功才撤标记（一次性）"
+        );
+    }
+
+    /// 课程入口按钮 + 无材料/无结构时的可执行提示；行内标题是 B 站
+    /// 用户数据，必须 textContent。
+    #[test]
+    fn course_entry_button_and_hints_exist() {
+        assert!(PANEL_JS.contains("课程"), "缺课程入口按钮");
+        assert!(
+            PANEL_JS.contains("还没拿到视频材料"),
+            "没材料时要引导先打开播放页"
+        );
+        assert!(
+            PANEL_JS.contains("点一集切过去 · 进度只存在本机浏览器"),
+            "要说清进度只存本机（管理预期）"
+        );
+        assert!(
+            PANEL_JS.contains("t.textContent = item.title || item.key"),
+            "B 站标题是用户数据，必须 textContent"
         );
     }
 }

@@ -336,6 +336,90 @@ async def _ensure_buvid3(client: Any, cookies: dict[str, str]) -> None:
         _log("已取匿名 buvid3 设备指纹（无登录态）")
 
 
+#: 分P/合集清单的条数上限。B 站真有 748 集「大全集」分P 视频（实测搜索见过），
+#: 全量落 provider_cache 会把材料 JSON 撑爆；截断只影响面板列表长度。
+_MAX_COURSE_ITEMS = 300
+
+
+def _extract_pages(pages: list[Any]) -> list[dict[str, Any]]:
+    """``view`` 接口的 ``pages`` → 分P 清单（#6 课程化）。
+
+    只要 page/part/cid/duration 四个字段：面板画列表 + 按全片时长换算秒数
+    够用，不带 dimension/first_frame 这些体积大的。坏行跳过，与上游
+    ``normalize_cues`` 的宽容策略一致。
+    """
+
+    rows: list[dict[str, Any]] = []
+    for item in pages or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            page = int(item.get("page") or 0)
+            cid = int(item.get("cid") or 0)
+            duration = float(item.get("duration") or 0)
+        except (TypeError, ValueError):
+            continue
+        if page <= 0 or cid <= 0:
+            continue
+        title = str(item.get("part") or "").strip() or f"P{page}"
+        rows.append(
+            {"page": page, "title": title[:_MAX_TITLE], "cid": cid, "duration": duration}
+        )
+    return rows[:_MAX_COURSE_ITEMS]
+
+
+def _extract_season(season: Any) -> dict[str, Any] | None:
+    """``view`` 接口的 ``ugc_season`` → 合集结构（#6 课程化）。
+
+    B 站合集是 sections→episodes 两层；episode 顶层 ``duration`` 实测是
+    ``None``，真实时长在 ``episode["page"]["duration"]``。扁平化成
+    ``[{bvid, cid, title, duration}]``；多 section 时把 section 标题并进
+    episode 标题（单 section 不加前缀，避免「默认分类 |」噪音）。
+    """
+
+    if not isinstance(season, dict):
+        return None
+    sections = season.get("sections") if isinstance(season.get("sections"), list) else []
+    multi = len(sections) > 1
+    flat: list[dict[str, Any]] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        sec_title = str(section.get("title") or "").strip()
+        episodes = (
+            section.get("episodes") if isinstance(section.get("episodes"), list) else []
+        )
+        for ep in episodes:
+            if not isinstance(ep, dict):
+                continue
+            bvid = str(ep.get("bvid") or "").strip()
+            page = ep.get("page") if isinstance(ep.get("page"), dict) else {}
+            try:
+                cid = int(ep.get("cid") or page.get("cid") or 0)
+                duration = float(page.get("duration") or 0)
+            except (TypeError, ValueError):
+                continue
+            if not bvid.startswith("BV") or cid <= 0:
+                continue
+            title = str(ep.get("title") or bvid).strip() or bvid
+            if multi and sec_title:
+                title = f"{sec_title} | {title}"
+            flat.append(
+                {
+                    "bvid": bvid,
+                    "cid": cid,
+                    "title": title[:_MAX_TITLE],
+                    "duration": duration,
+                }
+            )
+    if not flat:
+        return None
+    return {
+        "title": str(season.get("title") or "").strip()[:_MAX_TITLE],
+        "episodes": flat[:_MAX_COURSE_ITEMS],
+    }
+
+
 async def _fetch_bilibili_media(
     request: Any, languages: Any, capture: dict[str, Any] | None = None
 ) -> BilibiliMedia:
@@ -406,6 +490,12 @@ async def _fetch_bilibili_media(
             view = await _api_call(client, "/x/web-interface/view", {"bvid": request.bvid})
             if capture is not None:
                 capture["aid"] = int(view.get("aid") or 0)
+                # #6 课程化：分P清单 + 合集结构旁路捞出来（BilibiliMedia 是
+                # frozen+slots 塞不进，跟 aid 一个路子）。
+                capture["pages"] = _extract_pages(
+                    view.get("pages") if isinstance(view.get("pages"), list) else []
+                )
+                capture["season"] = _extract_season(view.get("ugc_season"))
             pages = view.get("pages") if isinstance(view.get("pages"), list) else []
             if not pages:
                 raise RuntimeError("Bilibili 未返回可播放分P")
@@ -628,6 +718,11 @@ async def _resolve_bilibili(module, url: str, language: Any) -> dict[str, Any]:
             # aid 给热评接口（x/v2/reply/main 的 oid）用；老材料没这个字段，
             # heat.py 会自己打 view 补，见那里的兜底分支。
             "bilibili_aid": int(captured.get("aid") or 0),
+            # #6 课程化：分P清单（page/part/cid/duration）与合集结构
+            # （sections→episodes 扁平化）。老材料没有这两个字段，
+            # series.py 端点会自己打 view 补取。
+            "bilibili_pages": captured.get("pages") or [],
+            "bilibili_season": captured.get("season"),
         },
         "_caption_text_version": 1,
     }
