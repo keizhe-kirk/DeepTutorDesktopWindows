@@ -121,32 +121,52 @@ const PANEL_JS: &str = r##"
   function installRecorder() {
     if (window[SUB_RECORDER]) { return; }
     window[SUB_RECORDER] = { material: null, detail: null, lastSeek: 0 };
+    window.__dtAsrCues = window.__dtAsrCues || null; // ASR 兜底生成的 cues
+    window.__dtAsrMid = window.__dtAsrMid || '';      // 已触发 ASR 的材料
     var orig = window.fetch;
     if (typeof orig !== 'function') { return; }
     window.fetch = function () {
-      var out = orig.apply(this, arguments);
+      var args = arguments;
+      var p = orig.apply(this, args);
       try {
-        var input = arguments[0];
+        var input = args[0];
         var href = typeof input === 'string' ? input
                  : (input && input.url) ? String(input.url) : '';
-        // 只克隆可能带材料的响应，避免给每个请求都加 JSON 解析开销
+        // 只处理可能带材料的响应，避免给每个请求都加 JSON 解析开销
         if (/material|reading|video-learning|watching/i.test(href)) {
-          out.then(function (resp) {
+          return p.then(function (resp) {
             try {
+              // 记录（不改响应）：材料无字幕就触发 ASR 兜底（#5）
               resp.clone().json().then(function (j) {
-                if (looksLikeMaterial(j)) { window[SUB_RECORDER].material = j; }
-                else if (looksLikeDetail(j)) { window[SUB_RECORDER].detail = j; }
+                if (j && j.material_id) {
+                  window[SUB_RECORDER].material = j;
+                  // 无字幕 → 触发 ASR 兜底（#5）。注意：不能用 looksLikeMaterial
+                  // 判断（它要求已有 cues，无字幕材料正好反之），按 material_id
+                  // 认材料、按 materialHasCues 认「要不要触发」。
+                  if (!materialHasCues(j)) { maybeTriggerAsr(j.material_id); }
+                } else if (looksLikeDetail(j)) {
+                  window[SUB_RECORDER].detail = j;
+                }
               }, function () {});
+              // 改写响应：ASR 已生成字幕且当前材料无字幕 → 注入 cues，
+              // 让字幕检索 / AI 陪看 / 标记同步全部自动可用。
+              if (window.__dtAsrCues && window.__dtAsrCues.length) {
+                return injectAsrInto(resp);
+              }
             } catch (e) {}
-          }, function () {});
+            return resp;
+          }, function (err) { return Promise.reject(err); });
         }
       } catch (e) {}
-      return out;
+      return p;
     };
     log('subtitle recorder installed');
   }
 
   function recordedCues() {
+    // ASR 兜底（#5）生成的 cues 直接复用：字幕检索 / AI 陪看 / 标记同步
+    // 全部自动可用，无需各自再判断。
+    if (window.__dtAsrCues && window.__dtAsrCues.length) { return window.__dtAsrCues; }
     var rec = window[SUB_RECORDER];
     var m = rec && rec.material;
     if (!m) { return []; }
@@ -157,6 +177,111 @@ const PANEL_JS: &str = r##"
     return rows.filter(function (r) {
       return r && typeof r === 'object' && String(r.text || '').trim();
     });
+  }
+
+  // ---- 无字幕 ASR 兜底（#5）----
+  // 触发条件：材料无字幕 + 后端 LM Studio 在跑（whisper 模型已加载）。
+  // 自动兜底：进沉浸页无字幕就后台拉音频 → 转写，完成时把 cues 注入
+  // transcript 响应（字幕检索 / AI 陪看 / 标记同步全部自动可用）。
+  // 失败（LM Studio 没跑 / 解不动 AAC / 风控）一律静默跳过，不当机不惊动用户。
+  var ASR_API = '/api/video-learning/bilibili/materials/';
+
+  function materialHasCues(j) {
+    if (!j || !j.material_id) { return true; } // 不是材料响应，不算缺
+    var t = j.transcript;
+    var cues = t && Array.isArray(t.cues) ? t.cues : null;
+    var segs = Array.isArray(j.segments) ? j.segments
+             : (t && Array.isArray(t.segments) ? t.segments : null);
+    return !!((cues && cues.length) || (segs && segs.length));
+  }
+
+  // 把 ASR cues 注入到材料响应里：应用读到的就是「带字幕」的 transcript。
+  function injectAsrInto(resp) {
+    return resp.clone().json().then(function (j) {
+      if (!j || !j.material_id) { return resp; }  // 不是材料响应
+      if (materialHasCues(j)) { return resp; }     // 已有字幕，绝不覆盖
+      if (!j.transcript || typeof j.transcript !== 'object') { j.transcript = {}; }
+      if (!Array.isArray(j.transcript.cues)) { j.transcript.cues = []; }
+      if (!Array.isArray(j.transcript.segments)) { j.transcript.segments = []; }
+      j.transcript.cues = window.__dtAsrCues;
+      j.transcript.segments = window.__dtAsrCues;
+      return new Response(JSON.stringify(j), {
+        status: resp.status,
+        statusText: resp.statusText,
+        headers: resp.headers
+      });
+    }, function () { return resp; });
+  }
+
+  // 触发一次 ASR（幂等：已在跑 / 已生成 / 本会话失败过都不再动）。
+  function maybeTriggerAsr(mid) {
+    if (!mid) { return; }
+    if (window.__dtAsrCues && window.__dtAsrCues.length) { return; } // 已生成
+    if (window.__dtAsrMid === mid) { return; }                        // 已在处理
+    try { if (sessionStorage.getItem('dtAsrErr:' + mid)) { return; } } catch (e) {}
+    window.__dtAsrMid = mid;
+    window.fetch(ASR_API + encodeURIComponent(mid) + '/asr',
+                 { method: 'POST', credentials: 'same-origin', cache: 'no-store' })
+      .then(function () { pollAsr(mid); })
+      .catch(function () { // 端点不存在 / 网络错 → 标记失败，静默
+        try { sessionStorage.setItem('dtAsrErr:' + mid, '1'); } catch (e) {}
+        window.__dtAsrMid = '';
+      });
+  }
+
+  // 轮询 ASR 状态：done 带 cues 就注入；error / 超时（6 分钟）就放弃（本会话）。
+  function pollAsr(mid) {
+    var ticks = 0;
+    var timer = window.setInterval(function () {
+      ticks += 1;
+      if (ticks > 120) {
+        window.clearInterval(timer);
+        try { sessionStorage.setItem('dtAsrErr:' + mid, '1'); } catch (e) {}
+        return;
+      }
+      window.fetch(ASR_API + encodeURIComponent(mid) + '/asr',
+                   { credentials: 'same-origin', cache: 'no-store' })
+        .then(function (r) { return r.json(); })
+        .then(function (s) {
+          if (s && s.state === 'done' && s.cues && s.cues.length) {
+            window.__dtAsrCues = s.cues;
+            window.clearInterval(timer);
+            showAsrToast('字幕已生成（语音转写兜底）');
+          } else if (s && s.state === 'error') {
+            window.clearInterval(timer);
+            try { sessionStorage.setItem('dtAsrErr:' + mid, '1'); } catch (e) {}
+          }
+        })
+        .catch(function () {});
+    }, 3000);
+  }
+
+  // 轻量提示（4 秒自动消失），界面无感但让人知道多了字幕。
+  function showAsrToast(msg) {
+    try {
+      var t = document.createElement('div');
+      t.textContent = msg;
+      t.style.cssText = 'position:fixed;left:50%;bottom:24px;transform:translateX(-50%);'
+        + 'background:rgba(0,0,0,.82);color:#fff;padding:8px 14px;border-radius:8px;'
+        + 'font-size:13px;z-index:2147483647;pointer-events:none;opacity:0;'
+        + 'transition:opacity .3s';
+      document.body.appendChild(t);
+      if (window.requestAnimationFrame) {
+        window.requestAnimationFrame(function () { t.style.opacity = '1'; });
+      } else { t.style.opacity = '1'; }
+      window.setTimeout(function () {
+        t.style.opacity = '0';
+        window.setTimeout(function () { if (t.parentNode) { t.parentNode.removeChild(t); } }, 300);
+      }, 4000);
+    } catch (e) {}
+  }
+
+  // 兜底检查：每 5s 看一眼当前材料有没有字幕，没有且没触发过就触发。
+  function checkAsr() {
+    var mid = recordedMaterialId();
+    if (!mid) { return; }
+    if (recordedCues().length) { return; } // 已有字幕（自带或 ASR）
+    maybeTriggerAsr(mid);
   }
 
   // ---- React 受控组件的 value 写入法----
@@ -1507,6 +1632,10 @@ const PANEL_JS: &str = r##"
       window.setInterval(tickProgress, 5000);
       window.addEventListener('pagehide', saveProgress);
     } catch (e) { log('progress boot failed: ' + e); }
+    // 无字幕 ASR 兜底（#5）：持续盯着当前材料，无字幕就触发后台转写。
+    try {
+      window.setInterval(checkAsr, 5000);
+    } catch (e) { log('asr boot failed: ' + e); }
     if (install()) { return; }
     var mo = new MutationObserver(function () {
       if (install()) { mo.disconnect(); }
@@ -2109,6 +2238,39 @@ fn injection_is_periodic_not_one_shot() {
         assert!(
             PANEL_JS.contains("t.textContent = item.title || item.key"),
             "B 站标题是用户数据，必须 textContent"
+        );
+    }
+
+    /// #5 无字幕 ASR 兜底：自动触发 + 完成后注入 transcript 响应。
+    #[test]
+    fn asr_auto_fallback_triggers_and_injects() {
+        assert!(
+            PANEL_JS.contains("/api/video-learning/bilibili/materials/"),
+            "ASR 走同源端点（与 series 同前缀）"
+        );
+        assert!(
+            PANEL_JS.contains("maybeTriggerAsr"),
+            "无字幕材料要触发 ASR"
+        );
+        assert!(
+            PANEL_JS.contains("if (!materialHasCues(j)) { maybeTriggerAsr"),
+            "材料无字幕才触发，有字幕不动"
+        );
+        assert!(
+            PANEL_JS.contains("injectAsrInto"),
+            "ASR 完成后要改写 transcript 响应注入 cues"
+        );
+        assert!(
+            PANEL_JS.contains("window.__dtAsrCues = s.cues"),
+            "ASR 完成要把 cues 挂到全局，字幕检索/AI陪看/标记自动可用"
+        );
+        assert!(
+            PANEL_JS.contains("sessionStorage.setItem('dtAsrErr:'"),
+            "本会话失败过要静默跳过，不反复重试"
+        );
+        assert!(
+            PANEL_JS.contains("showAsrToast"),
+            "ASR 完成要给个轻量提示"
         );
     }
 }

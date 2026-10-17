@@ -99,6 +99,11 @@ class _VideoLearningPatch:
                     from dtpatch_bili import series as bili_series
 
                     bili_series.install(module)
+                    # 无字幕 ASR 兜底（#5）：POST 触发 / GET 查状态的端点，
+                    # 后台跑长视频转写、失败静默降级，同样并列装完。
+                    from dtpatch_bili import asr as bili_asr
+
+                    bili_asr.install(module)
                 else:
                     # reading 路由：换 _ingestion() 注入我们的 loader；同时包
                     # annotations 路由把标记同步成复习卡（1.6.14 播放页的
