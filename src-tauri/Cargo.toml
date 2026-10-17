@@ -1,6 +1,6 @@
 [package]
 name = "DeepTutorDesktopWin"
-version = "0.2.20"
+version = "0.2.21"
 description = "Native Windows shell for HKUDS/DeepTutor"
 authors = ["DeepTutor Contributors"]
 edition = "2021"
@@ -14,8 +14,17 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# 构建期 workaround:tauri-build -> schemars 0.8.22 -> indexmap 1.9.3。
+# indexmap 1.x 的 build.rs 只有在显式开了 `std` 时才无条件标记 cfg(has_std);
+# 否则靠 autocfg 探测 sysroot 的 std,探测不到就会落到 no_std 变体
+# `IndexMap<K, V, S>`(S 无默认值),而 schemars 写的是两参数的 `IndexMap<K, V>` -> E0107。
+# 这里显式开 std 绕开探测。resolver v2 下 host/target 的 feature 分开算,所以
+# [dependencies] 里也要加一份(那边是 tauri-plugin -> schemars)。
+indexmap = { version = "1.9", features = ["std"] }
 
 [dependencies]
+# 同上:schemars 0.8.22 在 preserve_order 下需要带默认 S 的 IndexMap。
+indexmap = { version = "1.9", features = ["std"] }
 tauri = { version = "2.11", features = ["tray-icon", "image-png"] }
 tauri-plugin-single-instance = "2.4"
 tauri-plugin-autostart = "2.5"

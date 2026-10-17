@@ -4,13 +4,14 @@ version = 3
 
 [[package]]
 name = "DeepTutorDesktopWin"
-version = "0.2.20"
+version = "0.2.21"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
  "dirs 6.0.0",
  "hex",
+ "indexmap 1.9.3",
  "log",
  "parking_lot",
  "pep440_rs",
