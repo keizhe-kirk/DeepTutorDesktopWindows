@@ -336,8 +336,14 @@ async def _ensure_buvid3(client: Any, cookies: dict[str, str]) -> None:
         _log("已取匿名 buvid3 设备指纹（无登录态）")
 
 
-async def _fetch_bilibili_media(request: Any, languages: Any) -> BilibiliMedia:
+async def _fetch_bilibili_media(
+    request: Any, languages: Any, capture: dict[str, Any] | None = None
+) -> BilibiliMedia:
     """抓 B 站元数据 + 字幕 + 章节。
+
+    ``capture``（可选）用来把 ``view`` 接口里的 ``aid`` 截出来 —— 热评接口
+    （``x/v2/reply/main``）要拿它当 ``oid``。``BilibiliMedia`` 是上游
+    frozen+slots dataclass，塞不进额外字段，只能从旁路捞。
 
     ★ 为什么不能直接用上游 ``_load_bilibili_media``（实测三重失效）：
 
@@ -398,6 +404,8 @@ async def _fetch_bilibili_media(request: Any, languages: Any) -> BilibiliMedia:
                 )
 
             view = await _api_call(client, "/x/web-interface/view", {"bvid": request.bvid})
+            if capture is not None:
+                capture["aid"] = int(view.get("aid") or 0)
             pages = view.get("pages") if isinstance(view.get("pages"), list) else []
             if not pages:
                 raise RuntimeError("Bilibili 未返回可播放分P")
@@ -520,7 +528,7 @@ async def _resolve_bilibili(module, url: str, language: Any) -> dict[str, Any]:
     captured: dict[str, Any] = {}
 
     async def _loader(url_value: str, languages: Any):
-        media = await _fetch_bilibili_media(_parse(url_value), languages)
+        media = await _fetch_bilibili_media(_parse(url_value), languages, captured)
         captured["media"] = media
         return media
 
@@ -549,7 +557,7 @@ async def _resolve_bilibili(module, url: str, language: Any) -> dict[str, Any]:
 
     media = captured.get("media")
     if media is None:  # 兜底：理论上 loader 一定被调过
-        media = await _fetch_bilibili_media(_parse(record.source_url), langs)
+        media = await _fetch_bilibili_media(_parse(record.source_url), langs, captured)
 
     # ---- 2) 组装 video_learning 侧的 cues
     cues = _segments_to_cues(media.segments)
@@ -617,6 +625,9 @@ async def _resolve_bilibili(module, url: str, language: Any) -> dict[str, Any]:
         "provider_cache": {
             "bilibili_page": int(getattr(media, "page_number", 1) or 1),
             "bilibili_cid": int(getattr(media, "cid", 0) or 0),
+            # aid 给热评接口（x/v2/reply/main 的 oid）用；老材料没这个字段，
+            # heat.py 会自己打 view 补，见那里的兜底分支。
+            "bilibili_aid": int(captured.get("aid") or 0),
         },
         "_caption_text_version": 1,
     }

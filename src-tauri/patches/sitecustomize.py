@@ -89,6 +89,11 @@ class _VideoLearningPatch:
                     from dtpatch_bili import companion as bili_companion
 
                     bili_companion.install(module)
+                    # 高能进度条 + 热评（#4）：两个 GET 端点，失败走 body.error
+                    # 降级，同样是 include_router 之前装完。
+                    from dtpatch_bili import heat as bili_heat
+
+                    bili_heat.install(module)
                 else:
                     # reading 路由：换 _ingestion() 注入我们的 loader；同时包
                     # annotations 路由把标记同步成复习卡（1.6.14 播放页的

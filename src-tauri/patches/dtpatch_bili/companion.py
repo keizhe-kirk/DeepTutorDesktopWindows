@@ -80,6 +80,9 @@ class CompanionRequest(BaseModel):
     locator: int = 0
     #: explain 模式可指定标记 ID（reading annotation）。
     annotation_id: str = ""
+    #: 额外语料（如热评面板把高赞评论拼进来）。只 ask 模式用；
+    #: 空字符串 = 不启用，行为与以前完全一致。
+    context: str = ""
 
 
 def _log(msg: str) -> None:
@@ -248,10 +251,23 @@ def build_prompt(mode: str, cues: list[dict[str, Any]], request: CompanionReques
     rendered, truncated = _truncate(rendered, ASK_CONTEXT_BUDGET)
     note = "\n（字幕过长，已截断，只基于已给出的部分回答）" if truncated else ""
     scope = "当前播放位置附近" if request.position > 0 else "整个视频"
-    return _SYSTEM_PROMPT, (
+    prompt = (
         f"以下是{scope}的字幕（带时间戳）：{note}\n{rendered}\n\n"
         f"用户的问题：{request.question.strip() or '这个片段在讲什么？'}"
     )
+    # 热评语料（#4「AI 总结热评」）：评论区高赞不是字幕内容，明确告诉模型
+    # 它的地位，避免把观众评论当成视频内容引用。
+    extra = (request.context or "").strip()
+    if extra:
+        extra, context_truncated = _truncate(extra, 4000)
+        prompt += (
+            "\n\n以下是观众的热门评论（不是字幕内容，是其他观众的讨论，"
+            "可以用来了解大家的关注点，但不要当成视频里讲过的内容）："
+            + ("（评论过长已截断）" if context_truncated else "")
+            + "\n"
+            + extra
+        )
+    return _SYSTEM_PROMPT, prompt
 
 
 # ── LLM 调用 ──────────────────────────────────────────────────────

@@ -112,7 +112,7 @@ const PANEL_JS: &str = r##"
 
   function installRecorder() {
     if (window[SUB_RECORDER]) { return; }
-    window[SUB_RECORDER] = { material: null };
+    window[SUB_RECORDER] = { material: null, lastSeek: 0 };
     var orig = window.fetch;
     if (typeof orig !== 'function') { return; }
     window.fetch = function () {
@@ -346,19 +346,26 @@ const PANEL_JS: &str = r##"
   //   改参数即重载并从该秒开始（chunk 1241 里 `t:String(Math.floor(c))`）。
   //   React 只在 src 相对自己上次渲染值变化时才写 DOM，所以我们从外部改的
   //   属性能一直活到下一次前端主动 seek。
-  function seekBilibili(seconds) {
+  //   高能进度条（#4）也复用这个查找器，别各写各的。
+  function findBilibiliIframe() {
     var nodes = document.querySelectorAll('iframe');
     for (var i = 0; i < nodes.length; i++) {
       var src = nodes[i].src || '';
-      if (src.indexOf('player.bilibili.com/player.html') === -1) { continue; }
-      try {
-        var url = new URL(src);
-        url.searchParams.set('t', String(Math.max(0, Math.floor(seconds))));
-        nodes[i].src = url.toString();
-        return true;
-      } catch (e) { return false; }
+      if (src.indexOf('player.bilibili.com/player.html') !== -1) { return nodes[i]; }
     }
-    return false;
+    return null;
+  }
+
+  function seekBilibili(seconds) {
+    var frame = findBilibiliIframe();
+    if (!frame) { return false; }
+    try {
+      var url = new URL(frame.src);
+      url.searchParams.set('t', String(Math.max(0, Math.floor(seconds))));
+      frame.src = url.toString();
+      if (window[SUB_RECORDER]) { window[SUB_RECORDER].lastSeek = seconds; }
+      return true;
+    } catch (e) { return false; }
   }
 
   function fmtClock(sec) {
@@ -498,6 +505,524 @@ const PANEL_JS: &str = r##"
     return subOverlay;
   }
 
+  // ---- AI 陪看（#2）----
+  //
+  // ★ 为什么走后端端点而不是直连 LM Studio：补丁跑在后端进程里，
+  //   deeptutor.services.llm 就是前端所有 AI 功能的同一条链路 —— 用户在
+  //   设置里配的模型/base_url/key 自动生效，换模型不用改补丁。
+  // ★ 为什么同源 fetch 不用 IPC：与搜索同理（远端来源 ACL 全拒），
+  //   详见上面 SEARCH_API 的注释。
+  // ★ 位置哪来的：B 站 iframe 不往父窗口 postMessage 播放进度（2026-10-17
+  //   headless 探针实测只发一条 REQUEST_PARENT_TITLE），前端自己也不追
+  //   （tracksPosition:!1）—— 所以用 iframe src 的 t= 参数当「最近一次
+  //   定位」的近似，并允许用户手填秒数。没有位置就走全文上下文。
+  var AI_API = '/api/video-learning/bilibili';
+  var AI_MATERIALS_API = '/api/video-learning/bilibili/materials/';
+  var aiOverlay = null;
+  var aiMode = 'ask';
+
+  function recordedMaterialId() {
+    var rec = window[SUB_RECORDER];
+    var m = rec && rec.material;
+    return (m && m.material_id) ? String(m.material_id) : '';
+  }
+
+  // B 站 iframe 的 t= 参数：React 只在 seek 时改它，我们从外部改的值也能
+  // 活着 —— 这是不跨域拿到「最近定位」的最佳近似。
+  function currentPlayerSeconds() {
+    var frame = findBilibiliIframe();
+    if (!frame) { return 0; }
+    try {
+      var n = Number(new URL(frame.src).searchParams.get('t'));
+      return Number.isFinite(n) && n > 0 ? n : 0;
+    } catch (e) { return 0; }
+  }
+
+  function aiPost(mid, payload) {
+    return window.fetch(
+      AI_MATERIALS_API + encodeURIComponent(mid) + '/companion',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'same-origin',
+        body: JSON.stringify(payload)
+      }
+    ).then(function (r) {
+      return r.json().then(function (j) { return { ok: r.ok, body: j || {} }; },
+                           function () { return { ok: false, body: { error: '响应不是 JSON' } }; });
+    });
+  }
+
+  function aiStyleButton(text) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = text;
+    b.style.cssText = 'height:34px;padding:0 14px;font-size:13px;border-radius:8px;cursor:pointer;'
+      + 'border:1px solid var(--border,#e5e5e5);background:transparent;color:inherit';
+    return b;
+  }
+
+  function ensureAiOverlay() {
+    if (aiOverlay && document.body.contains(aiOverlay)) { return aiOverlay; }
+    aiOverlay = document.createElement('div');
+    aiOverlay.style.cssText = 'position:fixed;inset:0;z-index:2147483000;display:none;'
+      + 'align-items:center;justify-content:center;background:rgba(0,0,0,.45)';
+
+    var panel = document.createElement('div');
+    panel.style.cssText = 'width:min(680px,92vw);max-height:82vh;display:flex;flex-direction:column;'
+      + 'background:var(--card,#fff);color:var(--foreground,#111);border-radius:12px;'
+      + 'box-shadow:0 18px 50px rgba(0,0,0,.28);overflow:hidden';
+
+    var head = document.createElement('div');
+    head.style.cssText = 'display:flex;align-items:center;gap:8px;padding:12px 14px;'
+      + 'border-bottom:1px solid var(--border,#e5e5e5)';
+    var title = document.createElement('div');
+    title.textContent = 'AI 陪看';
+    title.style.cssText = 'font-size:14px;font-weight:500;flex:1';
+    var close = document.createElement('button');
+    close.type = 'button';
+    close.textContent = '关闭';
+    close.style.cssText = 'font-size:12px;padding:4px 10px;border-radius:6px;cursor:pointer;'
+      + 'border:1px solid var(--border,#e5e5e5);background:transparent;color:inherit';
+    close.onclick = function () { aiOverlay.style.display = 'none'; };
+    head.appendChild(title); head.appendChild(close);
+
+    // 模式切换
+    var tabs = document.createElement('div');
+    tabs.style.cssText = 'display:flex;gap:8px;padding:10px 14px 0';
+    var tabAsk = aiStyleButton('问一问');
+    var tabSum = aiStyleButton('章节摘要');
+    var tabExp = aiStyleButton('解释标记');
+    tabs.appendChild(tabAsk); tabs.appendChild(tabSum); tabs.appendChild(tabExp);
+
+    // 输入行
+    var row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:8px;padding:10px 14px 0';
+    var q = document.createElement('input');
+    q.type = 'text';
+    q.placeholder = '问一个关于这个视频的问题，如「刚才这句什么意思」';
+    q.style.cssText = 'flex:1;min-width:0;height:34px;padding:0 10px;font-size:13px;border-radius:8px;'
+      + 'border:1px solid var(--border,#e5e5e5);background:var(--background,#fff);color:inherit';
+    var go = document.createElement('button');
+    go.type = 'button';
+    go.textContent = '提问';
+    go.style.cssText = 'height:34px;padding:0 16px;font-size:13px;border-radius:8px;cursor:pointer;'
+      + 'border:0;background:var(--primary,#e9544b);color:var(--primary-foreground,#fff)';
+    row.appendChild(q); row.appendChild(go);
+
+    // 定位行：ask/explain 用；summary 不需要
+    var posRow = document.createElement('div');
+    posRow.style.cssText = 'display:flex;gap:8px;align-items:center;padding:8px 14px 0;font-size:12px;'
+      + 'color:var(--muted-foreground,#888)';
+    var posLabel = document.createElement('span');
+    posLabel.textContent = '定位（秒）';
+    var pos = document.createElement('input');
+    pos.type = 'number';
+    pos.min = '0';
+    pos.placeholder = '0 = 全文';
+    pos.style.cssText = 'width:110px;height:30px;padding:0 8px;font-size:12px;border-radius:8px;'
+      + 'border:1px solid var(--border,#e5e5e5);background:var(--background,#fff);color:inherit';
+    var usePos = aiStyleButton('用播放器位置');
+    posRow.appendChild(posLabel); posRow.appendChild(pos); posRow.appendChild(usePos);
+
+    var status = document.createElement('div');
+    status.style.cssText = 'padding:10px 14px 4px;font-size:12px;color:var(--muted-foreground,#888);min-height:18px';
+
+    // 标记列表（explain 模式）
+    var marks = document.createElement('div');
+    marks.style.cssText = 'display:none;flex:0 0 auto;max-height:22vh;overflow:auto;padding:4px 8px 0';
+
+    var answer = document.createElement('div');
+    answer.style.cssText = 'flex:1;overflow:auto;margin:8px 14px 14px;padding:12px;font-size:13px;'
+      + 'line-height:1.65;white-space:pre-wrap;word-break:break-word;border-radius:8px;'
+      + 'background:var(--muted,#f6f6f6);color:inherit';
+
+    panel.appendChild(head); panel.appendChild(tabs); panel.appendChild(row);
+    panel.appendChild(posRow); panel.appendChild(status); panel.appendChild(marks);
+    panel.appendChild(answer);
+    aiOverlay.appendChild(panel);
+    document.body.appendChild(aiOverlay);
+    aiOverlay.addEventListener('click', function (e) {
+      if (e.target === aiOverlay) { aiOverlay.style.display = 'none'; }
+    });
+
+    function tabStyle(active) {
+      return 'height:34px;padding:0 14px;font-size:13px;border-radius:8px;cursor:pointer;'
+        + 'border:1px solid var(--border,#e5e5e5);background:transparent;color:inherit'
+        + (active ? ';border-color:var(--primary,#e9544b);color:var(--primary,#e9544b)' : '');
+    }
+
+    function paintTabs() {
+      tabAsk.style.cssText = tabStyle(aiMode === 'ask');
+      tabSum.style.cssText = tabStyle(aiMode === 'summary');
+      tabExp.style.cssText = tabStyle(aiMode === 'explain');
+      q.style.display = aiMode === 'summary' ? 'none' : '';
+      q.placeholder = aiMode === 'explain'
+        ? '想重点解释什么（可留空，直接解释这一处）'
+        : '问一个关于这个视频的问题，如「刚才这句什么意思」';
+      go.textContent = aiMode === 'summary' ? '生成摘要' : (aiMode === 'explain' ? '解释这一处' : '提问');
+      posRow.style.display = aiMode === 'summary' ? 'none' : 'flex';
+      marks.style.display = aiMode === 'explain' ? 'block' : 'none';
+    }
+
+    function refreshStatus() {
+      var cues = recordedCues().length;
+      status.textContent = '字幕 ' + cues + ' 条 · 正在确认模型…';
+      window.fetch(AI_API + '/companion/status', { credentials: 'same-origin', cache: 'no-store' })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          if (j && j.available) {
+            status.textContent = '字幕 ' + cues + ' 条 · 模型 ' + (j.model || '?');
+          } else {
+            status.textContent = '字幕 ' + cues + ' 条 · ' + ((j && j.error) || '模型不可用');
+          }
+        })
+        .catch(function () { status.textContent = '字幕 ' + cues + ' 条 · 模型状态获取失败'; });
+    }
+
+    function loadMarks() {
+      var mid = recordedMaterialId();
+      marks.textContent = '';
+      if (!mid) { return; }
+      status.textContent = '正在加载标记…';
+      window.fetch('/api/reading/materials/' + encodeURIComponent(mid) + '/annotations',
+                   { credentials: 'same-origin', cache: 'no-store' })
+        .then(function (r) { return r.json(); })
+        .then(function (rows) {
+          var list = Array.isArray(rows) ? rows : [];
+          if (!list.length) {
+            status.textContent = '这个视频还没有标记 —— 先在播放页打几条，再来解释';
+            return;
+          }
+          status.textContent = '选一条标记来解释（共 ' + list.length + ' 条）';
+          list.slice(0, 20).forEach(function (row) {
+            var card = document.createElement('button');
+            card.type = 'button';
+            card.style.cssText = 'display:block;width:100%;text-align:left;padding:8px;margin-bottom:6px;'
+              + 'border-radius:8px;border:1px solid var(--border,#e5e5e5);background:transparent;'
+              + 'color:inherit;cursor:pointer';
+            card.onmouseenter = function () { card.style.background = 'var(--muted,#f3f3f3)'; };
+            card.onmouseleave = function () { card.style.background = 'transparent'; };
+            var head1 = document.createElement('div');
+            head1.style.cssText = 'font-size:12px;color:var(--muted-foreground,#888)';
+            head1.textContent = (row.kind || 'highlight') + ' · 片段 ' + (row.locator || '?');
+            var body = document.createElement('div');
+            body.style.cssText = 'font-size:13px;line-height:1.5;margin-top:2px';
+            body.textContent = String(row.note || row.quote || '').slice(0, 120);
+            card.appendChild(head1); card.appendChild(body);
+            card.onclick = function () {
+              pos.value = '';
+              ask('explain', String(row.note || ''), Number(row.locator) || 0);
+            };
+            marks.appendChild(card);
+          });
+        })
+        .catch(function () { status.textContent = '标记加载失败，可改用「问一问」'; });
+    }
+
+    // context：额外语料（#4「AI 总结热评」把高赞评论拼进来）。留空时
+    // 与以前完全一致 —— companion 的 ask 模式只在有 context 时才改 prompt。
+    function ask(mode, question, locator, context) {
+      var mid = recordedMaterialId();
+      if (!mid) {
+        status.textContent = '还没拿到视频材料 —— 请先打开这个视频的播放页，'
+          + '等材料加载完（字幕检索能搜到内容时就够了）再试';
+        return;
+      }
+      var payload = { mode: mode, question: question || '' };
+      if (mode !== 'summary') {
+        var seconds = Number(pos.value);
+        payload.position = Number.isFinite(seconds) && seconds > 0 ? seconds : 0;
+      }
+      if (locator) { payload.locator = locator; }
+      if (context) { payload.context = context; }
+      go.disabled = true;
+      status.textContent = mode === 'summary' ? '正在通读全片生成摘要…' : '正在思考…';
+      answer.textContent = '';
+      aiPost(mid, payload).then(function (res) {
+        go.disabled = false;
+        if (res.ok && res.body && res.body.answer) {
+          answer.textContent = res.body.answer;
+          var used = res.body.cues_used;
+          status.textContent = '完成 · 参考了 ' + (used || 0) + ' 条字幕'
+            + (res.body.elapsed_ms ? (' · ' + (res.body.elapsed_ms / 1000).toFixed(1) + 's') : '');
+        } else {
+          status.textContent = (res.body && res.body.error) || '请求失败';
+        }
+      }).catch(function (e) {
+        go.disabled = false;
+        status.textContent = '网络错误：' + (e && e.message ? e.message : 'unknown');
+      });
+    }
+
+    go.onclick = function () {
+      if (aiMode === 'summary') { ask('summary', '', 0); return; }
+      if (aiMode === 'explain') { ask('explain', (q.value || '').trim(), 0); return; }
+      var text = (q.value || '').trim();
+      if (!text) { status.textContent = '先输入问题；或切到「章节摘要」一键看全片结构'; return; }
+      ask('ask', text, 0);
+    };
+    q.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') { e.preventDefault(); go.onclick(); }
+    });
+    tabAsk.onclick = function () { aiMode = 'ask'; paintTabs(); refreshStatus(); };
+    tabSum.onclick = function () { aiMode = 'summary'; paintTabs(); refreshStatus(); };
+    tabExp.onclick = function () { aiMode = 'explain'; paintTabs(); refreshStatus(); loadMarks(); };
+    usePos.onclick = function () {
+      var s = currentPlayerSeconds();
+      pos.value = s > 0 ? String(s) : '';
+      status.textContent = s > 0
+        ? ('已填入播放器当前定位 ' + fmtClock(s) + '（B 站不上报实时进度，这是最近一次定位）')
+        : '没读到播放器定位，请手动填秒数';
+    };
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && aiOverlay && aiOverlay.style.display !== 'none') {
+        aiOverlay.style.display = 'none';
+      }
+    });
+
+    paintTabs();
+    aiOverlay.__dtAiRefresh = refreshStatus;
+    // 热评面板用：带语料提问（答案仍显示在 AI 面板里）。
+    aiOverlay.__dtAiAsk = ask;
+    return aiOverlay;
+  }
+
+  // ---- 高能进度条 + 热评（#4）----
+  //
+  // ★ 高能条为什么贴 iframe 上沿：B 站 iframe 不上报进度、也不接受外部
+  //   定位（只能改 src 的 t= 参数重载），进度条画进播放器内部不可能；
+  //   贴在播放器上方既能表达「全片弹幕密度」，又不遮播放器任何控件
+  //   （B 站控件条在底部，顶部 6px 盖的是画面，可接受）。
+  //   点击跳转复用 seekBilibili（与前端自己的 seek 同机制）。
+  // ★ 为什么要自己起 interval：本脚本每个页面上下文只跑一次
+  //   （window.__dtBiliPanel 幂等标记），boot 里那一次不够 —— 用户从别的
+  //   页面切回来、滚动页面都会让 iframe 移位。1s 轮询 + scroll/resize
+  //   监听足够，开销只是一次 querySelectorAll + getBoundingClientRect。
+  // ★ 失败必须**安静降级**：风控/网络失败时条置灰并在 title 里说明原因
+  //   （后端文案带倒计时），30s 内不重打；真没弹幕直接收掉，绝不挡画面。
+  var heatBar = null;
+  var heatFill = null;
+  var heatFor = '';
+  var heatState = '';       // '' = 没试过 / 'ok' = 有数据 / 'empty' = 确认没弹幕（终端态）
+  var heatFailedAt = -1e9;
+  var HEAT_COOLDOWN = 30000;
+  var hotOverlay = null;
+  var hotRows = [];
+
+  // 只收 DOM，不动 heatFor/heatState —— 状态机要能记住「这个视频试过」
+  function removeHeatBar() {
+    if (heatBar && heatBar.parentNode) { heatBar.parentNode.removeChild(heatBar); }
+    heatBar = null;
+    heatFill = null;
+  }
+
+  function ensureHeatBar() {
+    var frame = findBilibiliIframe();
+    if (!frame) { return; }
+    var mid = recordedMaterialId();
+    if (!mid) {
+      // 换了视频但材料还没到：旧条留着会拿旧时长跳新视频，先收掉
+      if (heatFor || heatBar) { removeHeatBar(); heatFor = ''; heatState = ''; }
+      return;
+    }
+    if (heatFor === mid && heatState === 'empty') { return; }  // 确认没弹幕：不建条
+    if (!heatBar || !document.body.contains(heatBar)) {
+      heatBar = document.createElement('div');
+      heatBar.title = '高能进度条 · 弹幕密度（点击跳转）';
+      heatBar.style.cssText = 'position:fixed;z-index:2147482000;height:6px;'
+        + 'border-radius:3px;background:var(--border,#e5e5e5);cursor:pointer;'
+        + 'overflow:hidden;box-shadow:0 0 0 1px rgba(0,0,0,.06)';
+      heatFill = document.createElement('div');
+      heatFill.style.cssText = 'height:100%;width:100%';
+      heatBar.appendChild(heatFill);
+      heatBar.onclick = function (e) {
+        var dur = Number(heatBar.getAttribute('data-duration')) || 0;
+        if (dur <= 0) { return; }
+        var rect = heatBar.getBoundingClientRect();
+        var ratio = (e.clientX - rect.left) / Math.max(1, rect.width);
+        var secs = Math.floor(Math.min(1, Math.max(0, ratio)) * dur);
+        if (seekBilibili(secs)) {
+          heatBar.title = '高能进度条 · 已跳到 ' + fmtClock(secs);
+        }
+      };
+      document.body.appendChild(heatBar);
+    }
+    var rect = frame.getBoundingClientRect();
+    if (rect.width < 40 || rect.height < 40 || rect.bottom < 0 || rect.top > window.innerHeight) {
+      heatBar.style.display = 'none';  // 播放器滚出视口：不收条（位置还会回来），只隐藏
+      return;
+    }
+    heatBar.style.display = 'block';
+    heatBar.style.left = Math.round(rect.left) + 'px';
+    heatBar.style.top = Math.round(Math.max(2, rect.top - 9)) + 'px';
+    heatBar.style.width = Math.round(rect.width) + 'px';
+    // 状态机：ok/empty 是终端态不再打接口；失败（state='' 且刚失败过）
+    // 走 30s 冷却 —— 防每轮轮询都重打，风控期间重试只会延长封禁
+    if (heatFor === mid) {
+      if (heatState === 'ok' || heatState === 'empty') { return; }
+      if (Date.now() - heatFailedAt < HEAT_COOLDOWN) { return; }
+    }
+    heatFor = mid;
+    loadHeat(mid);
+  }
+
+  function loadHeat(mid) {
+    if (!heatBar) { return; }
+    heatState = '';
+    heatFill.style.background = '';
+    heatBar.removeAttribute('data-duration');
+    heatBar.title = '高能进度条 · 正在读取弹幕密度…';
+    window.fetch(AI_MATERIALS_API + encodeURIComponent(mid) + '/heat',
+                 { credentials: 'same-origin', cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        if (!heatBar || heatFor !== mid) { return; }
+        var pts = (j && j.points) || [];
+        var max = Number(j && j.max) || 0;
+        var dur = Number(j && j.duration) || 0;
+        if (j && j.error) {
+          // 风控/网络失败：条留着但置灰，title 说清原因（后端文案带倒计时）
+          heatState = '';
+          heatFailedAt = Date.now();
+          heatBar.title = '高能进度条 · ' + j.error;
+          return;
+        }
+        if (!pts.length || max <= 0 || dur <= 0) {
+          heatState = 'empty';  // 终端态：确认没弹幕，不再打接口
+          removeHeatBar();
+          return;
+        }
+        heatState = 'ok';
+        heatBar.setAttribute('data-duration', String(dur));
+        // 一条 linear-gradient 画完整条密度（240 格 = 480 个 color stop，
+        // 单节点、无 240 个子 div，DOM 干净）
+        var stops = [];
+        for (var i = 0; i < pts.length; i++) {
+          var a = (0.22 + 0.78 * (pts[i] / max)).toFixed(2);
+          var p0 = (i / pts.length * 100).toFixed(2);
+          var p1 = ((i + 1) / pts.length * 100).toFixed(2);
+          stops.push('rgba(251,114,153,' + a + ') ' + p0 + '%');
+          stops.push('rgba(251,114,153,' + a + ') ' + p1 + '%');
+        }
+        heatFill.style.background = 'linear-gradient(to right,' + stops.join(',') + ')';
+        heatBar.title = '高能进度条 · 共 ' + (j.total || 0) + ' 条弹幕（点击跳转）';
+      })
+      .catch(function () {
+        if (heatFor === mid) {
+          heatState = '';
+          heatFailedAt = Date.now();
+        }
+        removeHeatBar();
+      });
+  }
+
+  // ---- 热评面板（#4）----
+  function ensureHotOverlay() {
+    if (hotOverlay && document.body.contains(hotOverlay)) { return hotOverlay; }
+    hotOverlay = document.createElement('div');
+    hotOverlay.style.cssText = 'position:fixed;inset:0;z-index:2147483000;display:none;'
+      + 'align-items:center;justify-content:center;background:rgba(0,0,0,.45)';
+
+    var panel = document.createElement('div');
+    panel.style.cssText = 'width:min(680px,92vw);max-height:82vh;display:flex;flex-direction:column;'
+      + 'background:var(--card,#fff);color:var(--foreground,#111);border-radius:12px;'
+      + 'box-shadow:0 18px 50px rgba(0,0,0,.28);overflow:hidden';
+
+    var head = document.createElement('div');
+    head.style.cssText = 'display:flex;align-items:center;gap:8px;padding:12px 14px;'
+      + 'border-bottom:1px solid var(--border,#e5e5e5)';
+    var title = document.createElement('div');
+    title.textContent = '热评';
+    title.style.cssText = 'font-size:14px;font-weight:500;flex:1';
+    var close = document.createElement('button');
+    close.type = 'button';
+    close.textContent = '关闭';
+    close.style.cssText = 'font-size:12px;padding:4px 10px;border-radius:6px;cursor:pointer;'
+      + 'border:1px solid var(--border,#e5e5e5);background:transparent;color:inherit';
+    close.onclick = function () { hotOverlay.style.display = 'none'; };
+    head.appendChild(title); head.appendChild(close);
+
+    // 顶栏：把高赞评论当语料喂给 AI（#4「评论区高赞作语料」）
+    var row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:8px;align-items:center;padding:12px 14px 0';
+    var askAi = aiStyleButton('AI 总结热评');
+    askAi.onclick = aiSummarizeHot;
+    var hint = document.createElement('span');
+    hint.style.cssText = 'font-size:12px;color:var(--muted-foreground,#888)';
+    hint.textContent = '让 AI 结合字幕和高赞评论，总结观众在讨论什么';
+    row.appendChild(askAi); row.appendChild(hint);
+
+    var status = document.createElement('div');
+    status.style.cssText = 'padding:10px 14px 4px;font-size:12px;color:var(--muted-foreground,#888);min-height:18px';
+    var list = document.createElement('div');
+    list.style.cssText = 'flex:1;overflow:auto;padding:0 8px 12px';
+
+    panel.appendChild(head); panel.appendChild(row); panel.appendChild(status); panel.appendChild(list);
+    hotOverlay.appendChild(panel);
+    document.body.appendChild(hotOverlay);
+    hotOverlay.addEventListener('click', function (e) {
+      if (e.target === hotOverlay) { hotOverlay.style.display = 'none'; }
+    });
+
+    function refresh() {
+      var mid = recordedMaterialId();
+      hotRows = [];
+      list.textContent = '';
+      if (!mid) {
+        status.textContent = '还没拿到视频材料 —— 先打开这个视频的播放页再试';
+        return;
+      }
+      status.textContent = '正在读取热评…';
+      window.fetch(AI_MATERIALS_API + encodeURIComponent(mid) + '/hot-comments',
+                   { credentials: 'same-origin', cache: 'no-store' })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          var rows = (j && j.comments) || [];
+          if (!rows.length) {
+            status.textContent = (j && j.error) || '这个视频还没有热门评论';
+            return;
+          }
+          hotRows = rows;
+          status.textContent = '高赞 ' + rows.length + ' 条 · 按点赞排序';
+          list.textContent = '';
+          rows.forEach(function (item) {
+            var card = document.createElement('div');
+            card.style.cssText = 'padding:8px;margin-bottom:6px;border-radius:8px;'
+              + 'border:1px solid var(--border,#e5e5e5)';
+            var meta = document.createElement('div');
+            meta.style.cssText = 'font-size:12px;color:var(--muted-foreground,#888)';
+            meta.textContent = item.user + ' · ' + (item.like || 0) + ' 赞'
+              + (item.replies ? (' · ' + item.replies + ' 条回复') : '');
+            var body = document.createElement('div');
+            body.style.cssText = 'font-size:13px;line-height:1.5;margin-top:2px;word-break:break-word';
+            body.textContent = String(item.text || '');
+            card.appendChild(meta); card.appendChild(body);
+            list.appendChild(card);
+          });
+        })
+        .catch(function () { status.textContent = '热评读取失败（不影响播放）'; });
+    }
+
+    hotOverlay.__dtHotRefresh = refresh;
+    return hotOverlay;
+  }
+
+  // 把已加载的热评拼成语料，借 AI 面板提问（答案显示在 AI 面板里）
+  function aiSummarizeHot() {
+    if (!hotRows.length) { return; }
+    var lines = [];
+    for (var i = 0; i < hotRows.length; i++) {
+      lines.push(hotRows[i].user + '（' + (hotRows[i].like || 0) + ' 赞）：' + hotRows[i].text);
+    }
+    var ov = ensureAiOverlay();
+    ov.style.display = 'flex';
+    if (ov.__dtAiAsk) {
+      ov.__dtAiAsk('ask', '结合下面的热门评论，总结观众在讨论什么、提到哪些知识点', 0,
+                   lines.join('\n'));
+    }
+  }
+
   // ---- 装按钮 ----
   function install() {
     var input = findAnchorInput();
@@ -534,6 +1059,38 @@ const PANEL_JS: &str = r##"
     };
     (btn.parentElement || btn).insertBefore(sub, btn.nextSibling);
 
+    // AI 陪看按钮（#2）：问一问 / 章节摘要 / 解释标记。没字幕数据时面板
+    // 会给明确提示，不会静默失败。
+    var ai = document.createElement('button');
+    ai.type = 'button';
+    ai.textContent = 'AI 陪看';
+    ai.style.cssText = 'margin-left:8px;height:34px;padding:0 12px;font-size:13px;cursor:pointer;'
+      + 'border-radius:8px;border:1px solid var(--border,#e5e5e5);'
+      + 'background:transparent;color:var(--foreground,inherit)';
+    ai.onclick = function () {
+      var ov = ensureAiOverlay();
+      ov.style.display = 'flex';
+      if (ov.__dtAiRefresh) { ov.__dtAiRefresh(); }
+      var box = ov.querySelector('input');
+      if (box) { box.focus(); }
+    };
+    (sub.parentElement || sub).insertBefore(ai, sub.nextSibling);
+
+    // 热评按钮（#4）：评论区高赞 + 「AI 总结热评」语料入口。取不到时
+    // 面板给明确提示，不影响播放。
+    var hot = document.createElement('button');
+    hot.type = 'button';
+    hot.textContent = '热评';
+    hot.style.cssText = 'margin-left:8px;height:34px;padding:0 12px;font-size:13px;cursor:pointer;'
+      + 'border-radius:8px;border:1px solid var(--border,#e5e5e5);'
+      + 'background:transparent;color:var(--foreground,inherit)';
+    hot.onclick = function () {
+      var ov = ensureHotOverlay();
+      ov.style.display = 'flex';
+      if (ov.__dtHotRefresh) { ov.__dtHotRefresh(); }
+    };
+    (ai.parentElement || ai).insertBefore(hot, ai.nextSibling);
+
     log('button installed');
     return true;
   }
@@ -541,6 +1098,14 @@ const PANEL_JS: &str = r##"
   // ---- 盯 DOM：SPA 切页不会触发 on_page_load，只能自己观察 ----
   function boot() {
     installRecorder();
+    // 高能进度条（#4）：立即跑一次 + 1s 轮询 + 滚动/缩放重定位。
+    // 本脚本每页面上下文只跑一次，轮询是唯一的「持续跟踪」手段。
+    try {
+      ensureHeatBar();
+      window.setInterval(ensureHeatBar, 1000);
+      window.addEventListener('scroll', ensureHeatBar, true);
+      window.addEventListener('resize', ensureHeatBar);
+    } catch (e) { log('heat bar boot failed: ' + e); }
     if (install()) { return; }
     var mo = new MutationObserver(function () {
       if (install()) { mo.disconnect(); }
@@ -851,5 +1416,183 @@ fn injection_is_periodic_not_one_shot() {
     fn subtitle_highlight_avoids_inner_html() {
         assert!(PANEL_JS.contains("appendHighlighted"), "缺高亮分段函数");
         assert!(PANEL_JS.contains("createTextNode"), "高亮要用文本节点拼接");
+    }
+
+    /// ★ #2 AI 陪看：必须打后端已挂的 companion 端点（同源 fetch），复用
+    /// 用户配置的 LLM（LM Studio 等）—— 不自己直连模型服务，换模型不用改补丁。
+    #[test]
+    fn ai_companion_uses_backend_endpoint() {
+        assert!(
+            PANEL_JS.contains("/api/video-learning/bilibili/materials/"),
+            "陪看必须打后端 companion 端点"
+        );
+        assert!(
+            PANEL_JS.contains("/companion/status"),
+            "打开面板要先确认模型是否可用"
+        );
+        assert!(
+            PANEL_JS.contains("credentials: 'same-origin'"),
+            "同源 fetch 要显式带 cookie，否则鉴权失败"
+        );
+    }
+
+    /// 三种模式都要有：问一问 / 章节摘要 / 解释标记。
+    #[test]
+    fn ai_companion_has_three_modes() {
+        for token in ["问一问", "章节摘要", "解释标记", "'ask'", "'summary'", "'explain'"] {
+            assert!(PANEL_JS.contains(token), "陪看缺少模式 {token}");
+        }
+    }
+
+    /// 位置来源：B 站 iframe 不上报实时进度（2026-10-17 headless 探针实测
+    /// 只发一条 REQUEST_PARENT_TITLE），只能用 t= 参数近似 + 允许手填；
+    /// 没有位置走后端全文上下文。
+    #[test]
+    fn ai_companion_position_is_best_effort() {
+        assert!(
+            PANEL_JS.contains("currentPlayerSeconds"),
+            "要能从 iframe t= 参数读最近定位"
+        );
+        assert!(
+            PANEL_JS.contains("用播放器位置"),
+            "要有一键填入播放器位置的按钮"
+        );
+        assert!(
+            PANEL_JS.contains("Number.isFinite(seconds)"),
+            "position 要校验，非数字不能发给后端"
+        );
+    }
+
+    /// 解释标记模式要读 reading annotations（1.6.14 播放页标记的真身，
+    /// 不再是 video_learning 的 marks）。
+    #[test]
+    fn ai_companion_explain_reads_annotations() {
+        assert!(
+            PANEL_JS.contains("/api/reading/materials/"),
+            "解释标记要从 reading annotations 取列表"
+        );
+        assert!(
+            PANEL_JS.contains("/annotations"),
+            "annotations 端点路径要对"
+        );
+    }
+
+    /// 陪看入口按钮 + 无材料/无模型时的可执行提示。
+    #[test]
+    fn ai_companion_entry_and_hints_exist() {
+        assert!(PANEL_JS.contains("AI 陪看"), "缺 AI 陪看入口按钮");
+        assert!(
+            PANEL_JS.contains("还没拿到视频材料"),
+            "没材料时要引导先打开播放页"
+        );
+        assert!(
+            PANEL_JS.contains("模型不可用") || PANEL_JS.contains("模型状态获取失败"),
+            "模型不可用时要明说"
+        );
+    }
+
+    /// 回答渲染必须走 textContent（模型输出等同不可信内容），并保留换行。
+    #[test]
+    fn ai_companion_answer_uses_text_content() {
+        assert!(
+            PANEL_JS.contains("answer.textContent = res.body.answer"),
+            "回答必须走 textContent"
+        );
+        assert!(
+            PANEL_JS.contains("white-space:pre-wrap"),
+            "回答区要保留换行"
+        );
+    }
+
+    /// ★ #4 高能进度条：必须打后端 /heat 端点（同源 fetch），弹幕密度由
+    /// 后端算好（list.so XML → 每秒密度点串），前端只画条。
+    #[test]
+    fn heat_bar_uses_backend_endpoint() {
+        assert!(
+            PANEL_JS.contains("'/heat'"),
+            "高能条要打后端 /heat 端点"
+        );
+        assert!(
+            PANEL_JS.contains("'/hot-comments'"),
+            "热评要打后端 /hot-comments 端点"
+        );
+        assert!(
+            PANEL_JS.contains("credentials: 'same-origin'"),
+            "同源 fetch 要显式带 cookie，否则鉴权失败"
+        );
+    }
+
+    /// 高能条是装饰性功能：失败必须安静降级 —— 风控失败置灰并在 title
+    /// 说明原因（后端文案带倒计时），真没弹幕直接收掉，绝不挡画面。
+    #[test]
+    fn heat_bar_degrades_silently() {
+        assert!(
+            PANEL_JS.contains("function removeHeatBar"),
+            "要能把条收掉（降级路径）"
+        );
+        assert!(
+            PANEL_JS.contains("if (j && j.error)"),
+            "后端报错（风控/网络）要识别并置灰说明，不能当没弹幕"
+        );
+        assert!(
+            PANEL_JS.contains("heatState = 'empty'"),
+            "零弹幕要是终端态，不能每轮轮询都重打接口"
+        );
+        assert!(
+            PANEL_JS.contains("heatFailedAt"),
+            "失败后要冷却，不能每轮轮询都重打接口"
+        );
+    }
+
+    /// 点条跳转必须换算全片时长并复用 seekBilibili（改 t= 参数），
+    /// 与前端自己的 seek 同机制。
+    #[test]
+    fn heat_bar_click_seeks() {
+        assert!(
+            PANEL_JS.contains("if (seekBilibili(secs))"),
+            "点高能条要复用 seekBilibili 跳转"
+        );
+        assert!(
+            PANEL_JS.contains("getAttribute('data-duration')"),
+            "跳转要按全片时长把点击位置换算成秒数"
+        );
+        assert!(
+            PANEL_JS.contains("function findBilibiliIframe"),
+            "iframe 查找要收敛成共用函数（seek/位置/高能条复用）"
+        );
+    }
+
+    /// 高能条贴在 iframe 上沿（不遮播放器控件），且要持续跟踪 iframe
+    /// 位置 —— 本脚本每页面上下文只跑一次，必须轮询。
+    #[test]
+    fn heat_bar_tracks_iframe_position() {
+        assert!(
+            PANEL_JS.contains("rect.top - 9"),
+            "条要贴在 iframe 上沿而不是盖住播放器"
+        );
+        assert!(
+            PANEL_JS.contains("window.setInterval(ensureHeatBar, 1000)"),
+            "要 1s 轮询重定位（一次性注入不够：SPA 切页/滚动都会移位）"
+        );
+        assert!(
+            PANEL_JS.contains("addEventListener('scroll', ensureHeatBar, true)"),
+            "滚动要即时重定位（捕获阶段才能听到容器滚动）"
+        );
+    }
+
+    /// 热评面板 + 「AI 总结热评」：高赞评论当语料进 companion 的 context
+    /// 字段，答案仍显示在 AI 面板（textContent 渲染）。
+    #[test]
+    fn hot_comments_feed_ai_as_context() {
+        assert!(PANEL_JS.contains("热评"), "缺热评入口按钮");
+        assert!(PANEL_JS.contains("AI 总结热评"), "缺热评喂 AI 的入口");
+        assert!(
+            PANEL_JS.contains("aiOverlay.__dtAiAsk = ask"),
+            "AI 面板要暴露带语料提问的入口"
+        );
+        assert!(
+            PANEL_JS.contains("payload.context = context"),
+            "热评语料要进 payload.context 字段"
+        );
     }
 }
