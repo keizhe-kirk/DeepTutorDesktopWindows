@@ -5,12 +5,25 @@
 ``video_learning`` 的骨架早就齐了：播放、时间戳字幕、marks、notes、进度。
 ``practice`` / ``question_notebook`` 也早就有了完整的间隔复习体系
 （``notebook_entries`` + ``PracticeStore``）。**但两者从来没接通过** ——
-用户在视频里打的标记（``key_point`` / ``question`` / ``review``）只躺在
-``material["learning"]["marks"]`` 里，复习系统完全看不到。
+用户在视频里打的标记只躺在材料数据里，复习系统完全看不到。
 
 这个模块把标记自动转成复习卡：
 
-    mark ──► notebook_entry（题库）──► PracticeStore 队列 ──► /api/practice/queue
+    标记 ──► notebook_entry（题库）──► PracticeStore 队列 ──► /api/practice/queue
+
+# ★ 1.6.14 起标记走 reading annotations（2026-10-17 真机前端考古实锤）
+
+播放页（chunk 1241 的 ``MediaReadingStage``）的 ``saveMark`` 来自
+``ReadingProvider``（模块 15163），落点是
+``PUT /api/reading/materials/{id}/annotations`` —— **不是** video_learning
+的 ``/marks`` 路由（那套路由前端早就弃用了，``mark-suggestions`` 在前端
+产物里 0 引用）。所以本模块同时包两套路由：
+
+- **reading annotations**（主路径，``vann:`` 前缀）：``Annotation`` 的
+  ``locator`` 就是字幕片段序号，秒数从 ``unit_references`` 的
+  ``source_href="#t=123"`` 解析；
+- **video_learning marks**（兜底路径，``vmark:`` 前缀）：万一别的客户端
+  还在用老路由，行为不变。
 
 # 为什么写进 ``notebook_entries`` 而不是自己存一套
 
@@ -27,7 +40,8 @@
 - ``origin_type="external_import"`` + ``origin_ref=material_id``
   （external_import 强制要求 origin_ref 非空；session_id 留空，
   ``is_visible`` 允许 ``session_id IS NULL``）。
-- ``question_id="vmark:{mark_id}"`` —— 稳定 ID，重同步走更新分支。
+- ``question_id="vann:{annotation_id}"`` / ``"vmark:{mark_id}"`` ——
+  稳定 ID，重同步走更新分支。
 - ``source="immersive_reading"`` / ``assessment_type="review"`` /
   ``result="ungraded"`` / ``is_correct=0`` → ``resolved=0``，
   卡片保持「待复习」而不是被判定为已答对。
@@ -44,12 +58,16 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
 
-#: 条目来源标识前缀，同时用于列出卡片时过滤（见 ``list_cards``）。
+#: video_learning marks 卡片前缀（兜底路径）。
 CARD_PREFIX = "vmark:"
+
+#: reading annotations 卡片前缀（1.6.14 主路径）。
+ANNOTATION_PREFIX = "vann:"
 
 #: 与上游 ``QuestionOriginType`` 对齐。
 ORIGIN_TYPE = "external_import"
@@ -65,8 +83,6 @@ _KIND_HINT = {
     "question": "回答当时的问题",
     "review": "复习这个片段",
 }
-
-_INSTALLED = False
 
 
 def _log(msg: str) -> None:
@@ -199,6 +215,130 @@ def _store():
     return get_sqlite_session_store()
 
 
+# ── reading annotations（1.6.14 主路径） ──────────────────────────
+
+
+def _field(obj: Any, name: str, default: Any = None) -> Any:
+    """dataclass / dict 通吃取值（Annotation 是 dataclass，测试可能传 dict）。"""
+
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+    return getattr(obj, name, default)
+
+
+def _reading_store():
+    from deeptutor.reading.store import ReadingStore
+
+    return ReadingStore()
+
+
+def _locator_seconds(store: Any, material_id: str) -> dict[int, float]:
+    """``locator → 起始秒数``。
+
+    上游摄入 B 站视频时给每个片段写了
+    ``UnitReference(source_href="#t={int(start_seconds)}")`` —— 秒数就藏在这儿。
+    """
+
+    out: dict[int, float] = {}
+    try:
+        for ref in store.unit_references(material_id) or []:
+            href = str(_field(ref, "source_href", "") or "")
+            match = re.search(r"#\s*t\s*=\s*(\d+)", href)
+            if not match:
+                continue
+            try:
+                out[int(_field(ref, "locator", 0))] = float(match.group(1))
+            except (TypeError, ValueError):
+                continue
+    except Exception as exc:  # noqa: BLE001 - 秒数缺失只影响时间戳展示
+        _log(f"读取 unit_references 失败（时间戳将显示 0:00）: {exc}")
+    return out
+
+
+def card_for_annotation(
+    material_id: str,
+    title: str,
+    annotation: Any,
+    seconds: float = 0.0,
+) -> dict[str, Any] | None:
+    """把一条 reading annotation 转成 ``notebook_entries`` 条目。
+
+    ``quote`` 是标记覆盖的文本（视频里就是那句字幕），``note`` 是用户自己
+    写的笔记。正面取 note（没有就退化成「回忆这个片段」），背面给出处 +
+    原话 —— 「我记的要点 → 原话」正好构成一张回忆卡。
+    """
+
+    annotation_id = str(_field(annotation, "annotation_id", "") or "").strip()
+    if not annotation_id:
+        return None
+    quote = _clip(_field(annotation, "quote", ""))
+    note = _clip(_field(annotation, "note", ""))
+    if not quote and not note:
+        return None
+
+    material_id = str(material_id or "").strip()
+    if not material_id:
+        return None
+
+    stamp = _mmss(seconds)
+    question = note or f"回忆这个片段（{stamp}）"
+    explanation = (
+        f"来自《{title}》{stamp}\n{quote}" if quote else f"来自《{title}》{stamp}"
+    )
+    return {
+        "session_id": None,
+        "origin_type": ORIGIN_TYPE,
+        "origin_ref": material_id,
+        "turn_id": "",
+        "question_id": f"{ANNOTATION_PREFIX}{annotation_id}",
+        "question": question,
+        "question_type": "",
+        "options": {},
+        "correct_answer": "",
+        "explanation": explanation,
+        "difficulty": "",
+        "user_answer": "",
+        "source": CARD_SOURCE,
+        "material_id": material_id,
+        "material_title": title,
+        "section_id": "",
+        "section_title": stamp,
+        "assessment_type": "review",
+        "result": "ungraded",
+        "attempt_count": 1,
+        "hints_used": 0,
+        "is_correct": False,
+    }
+
+
+async def sync_annotations(material_id: str, store: Any = None) -> dict[str, Any]:
+    """把一个材料的全部 reading annotations 同步成复习卡（幂等）。"""
+
+    store = store if store is not None else _reading_store()
+    manifest = store.manifest(material_id)
+    title = _clip(_field(manifest, "title", "") or "视频", 120) or "视频"
+    annotations = store.annotations(material_id) or []
+    seconds = _locator_seconds(store, material_id)
+    items = [
+        card
+        for card in (
+            card_for_annotation(
+                material_id, title, row, seconds.get(int(_field(row, "locator", 0) or 0), 0.0)
+            )
+            for row in annotations
+        )
+        if card is not None
+    ]
+    synced = 0
+    if items:
+        synced = await _store().upsert_notebook_entries(None, items)
+    return {
+        "material_id": material_id,
+        "annotations": len(annotations),
+        "synced": synced,
+    }
+
+
 def _load_material(material_id: str) -> dict[str, Any]:
     from deeptutor.video_learning import service as vl
 
@@ -243,8 +383,24 @@ async def backfill_all(limit: int = 500) -> dict[str, Any]:
     """把**历史**材料里的标记一次性补建成复习卡。
 
     自动同步只对「本次会话里新建/修改的标记」生效；升级前打的老标记要靠
-    这个补一次。幂等，重复跑只会 update 不会重复建卡。
+    这个补一次。幂等，重复跑只会 update 不会重复建卡。两套存储都跑：
+    timed_media（marks） + reading（annotations）。
     """
+
+    outcome = await backfill_marks(limit)
+    annotations = await backfill_annotations(limit)
+    return {
+        "materials": int(outcome.get("materials") or 0)
+        + int(annotations.get("materials") or 0),
+        "synced": int(outcome.get("synced") or 0) + int(annotations.get("synced") or 0),
+        "failed": int(outcome.get("failed") or 0) + int(annotations.get("failed") or 0),
+        "marks": outcome,
+        "annotations": annotations,
+    }
+
+
+async def backfill_marks(limit: int = 500) -> dict[str, Any]:
+    """timed_media 里的 marks 补建（video_learning 老路径）。"""
 
     root = _store_root()
     result = {"materials": 0, "synced": 0, "failed": 0}
@@ -259,6 +415,39 @@ async def backfill_all(limit: int = 500) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 - 单个材料坏掉不拖垮整批
             result["failed"] += 1
             _log(f"补建跳过 {path.name}: {type(exc).__name__}: {exc}")
+    return result
+
+
+async def backfill_annotations(limit: int = 500) -> dict[str, Any]:
+    """reading annotations 补建（1.6.14 主路径）。
+
+    只扫 ``render_mode`` 是 video/audio 的材料 —— 文档的 annotate 是
+    阅读批注，不是「边看边学」的标记，不该混进复习队列。
+    """
+
+    result = {"materials": 0, "synced": 0, "failed": 0}
+    try:
+        store = _reading_store()
+        manifests = store.list_materials() or []
+    except Exception as exc:  # noqa: BLE001 - 列不出材料就本次跳过
+        _log(f"reading 材料枚举失败: {type(exc).__name__}: {exc}")
+        return result
+    for manifest in manifests[:limit]:
+        material_id = str(_field(manifest, "material_id", "") or "")
+        if not material_id:
+            continue
+        if str(_field(manifest, "render_mode", "text") or "text") not in {
+            "video",
+            "audio",
+        }:
+            continue
+        try:
+            outcome = await sync_annotations(material_id, store=store)
+            result["materials"] += 1
+            result["synced"] += int(outcome.get("synced") or 0)
+        except Exception as exc:  # noqa: BLE001 - 单个材料坏掉不拖垮整批
+            result["failed"] += 1
+            _log(f"annotation 补建跳过 {material_id}: {type(exc).__name__}: {exc}")
     return result
 
 
@@ -291,11 +480,11 @@ async def _backfill_task() -> None:
         _log(f"历史标记补建失败（不影响使用，可手动调 review-backfill）: {exc}")
 
 
-async def drop_card(material_id: str, mark_id: str) -> bool:
+async def drop_card(material_id: str, mark_id: str, prefix: str = CARD_PREFIX) -> bool:
     """删掉某个标记对应的复习卡（标记被删时调用）。"""
 
     entry = await _store().find_notebook_entry_by_origin(
-        ORIGIN_TYPE, material_id, f"{CARD_PREFIX}{mark_id}"
+        ORIGIN_TYPE, material_id, f"{prefix}{mark_id}"
     )
     if not entry:
         return False
@@ -313,18 +502,30 @@ async def list_cards(material_id: str) -> list[dict[str, Any]]:
         for row in items
         if isinstance(row, dict)
         and str(row.get("origin_type") or "") == ORIGIN_TYPE
-        and str(row.get("question_id") or "").startswith(CARD_PREFIX)
+        and str(row.get("question_id") or "").startswith((CARD_PREFIX, ANNOTATION_PREFIX))
     ]
 
 
 async def _maybe_sync(material_id: str) -> None:
-    """自动同步入口：设置关了就跳过，失败只记录不抛出。"""
+    """自动同步入口（marks 路径）：设置关了就跳过，失败只记录不抛出。"""
 
     try:
         if not load_settings().get("auto_sync", True):
             return
         result = await sync_material(material_id)
         _log(f"复习卡已同步: {result}")
+    except Exception as exc:  # noqa: BLE001 - 卡片是增强，不能拖垮标记
+        _log(f"复习卡同步失败（不影响标记本身）: {type(exc).__name__}: {exc}")
+
+
+async def _maybe_sync_annotations(material_id: str) -> None:
+    """自动同步入口（annotations 路径）：同上，失败只记录不抛出。"""
+
+    try:
+        if not load_settings().get("auto_sync", True):
+            return
+        result = await sync_annotations(material_id)
+        _log(f"复习卡已同步（annotations）: {result}")
     except Exception as exc:  # noqa: BLE001 - 卡片是增强，不能拖垮标记
         _log(f"复习卡同步失败（不影响标记本身）: {type(exc).__name__}: {exc}")
 
@@ -421,6 +622,60 @@ def _wrap_mark_routes(router_module, router) -> int:
     return wrapped
 
 
+def _wrap_annotation_routes(router_module, router) -> int:
+    """给 reading annotations 的增/删接口包一层「事后同步复习卡」。
+
+    1.6.14 播放页的标记就走这两条路由（``ReadingProvider.saveMark`` →
+    ``PUT /materials/{id}/annotations``；``removeMark`` → DELETE）。
+    body 模型是路由模块里的 ``AnnotationPayload``。
+    """
+
+    wrapped = 0
+    payload_model = getattr(router_module, "AnnotationPayload", None)
+
+    def _make_put(original, model):
+        # 模型在运行时才知道（getattr），所以用工厂把注解写进函数签名——
+        # FastAPI 靠签名认 JSON body，运行后再补 __annotations__ 不可靠。
+        async def put_endpoint(material_id: str, payload: model):
+            result = await original(material_id, payload)
+            await _maybe_sync_annotations(material_id)
+            return result
+
+        return put_endpoint
+
+    def _make_delete(original):
+        async def delete_endpoint(
+            material_id: str, annotation_id: str, *args: Any, **kwargs: Any
+        ):
+            result = await original(material_id, annotation_id, *args, **kwargs)
+            try:
+                await drop_card(material_id, annotation_id, prefix=ANNOTATION_PREFIX)
+            except Exception as exc:  # noqa: BLE001
+                _log(f"删除复习卡失败（标记已删）: {type(exc).__name__}: {exc}")
+            await _maybe_sync_annotations(material_id)
+            return result
+
+        return delete_endpoint
+
+    # ---- PUT /materials/{material_id}/annotations ---------------------------
+    route = _find_route(router, "/materials/{material_id}/annotations", "PUT")
+    if route is not None and payload_model is not None:
+        route.endpoint = _make_put(route.endpoint, payload_model)
+        wrapped += 1
+    else:
+        _log("没找到 PUT /annotations 路由（或 AnnotationPayload 缺失），标记不同步卡片")
+
+    # ---- DELETE /materials/{material_id}/annotations/{annotation_id} --------
+    route = _find_route(router, "/materials/{material_id}/annotations/{annotation_id}", "DELETE")
+    if route is not None:
+        route.endpoint = _make_delete(route.endpoint)
+        wrapped += 1
+    else:
+        _log("没找到 DELETE /annotations/{id} 路由，删除不联动删卡")
+
+    return wrapped
+
+
 def _wrap_material_get(router) -> bool:
     """给 ``GET /materials/{material_id}`` 包一层「首次打开触发历史补建」。
 
@@ -447,18 +702,26 @@ def _wrap_material_get(router) -> bool:
     return True
 
 
-def install(router_module) -> bool:
-    """Wrap mark routes and register review endpoints. Idempotent."""
+#: 按模块名记录已挂载的路由（两个 router 模块各挂一次，端点只注册一次）。
+_INSTALLED_MODULES: set[str] = set()
 
-    global _INSTALLED
-    if _INSTALLED:
+
+def install(router_module, add_endpoints: bool = True) -> bool:
+    """Wrap mark/annotation routes and register review endpoints.
+
+    ``add_endpoints=False`` 给 reading 路由用：它只包路由、不新增端点
+    （端点统一挂在 video_learning 路由下，面板只认那一份路径）。
+    同一个模块重复调用是幂等的。
+    """
+
+    module_name = str(getattr(router_module, "__name__", "") or id(router_module))
+    if module_name in _INSTALLED_MODULES:
         return False
 
     router = getattr(router_module, "router", None)
     if router is None:
         return False
 
-    from fastapi import Query
     from fastapi.responses import JSONResponse
     from pydantic import BaseModel
 
@@ -466,66 +729,74 @@ def install(router_module) -> bool:
         auto_sync: bool = True
 
     wrapped = _wrap_mark_routes(router_module, router)
+    wrapped += _wrap_annotation_routes(router_module, router)
     wrapped_get = _wrap_material_get(router)
 
-    @router.get("/bilibili/materials/{material_id}/review-cards")
-    async def bilibili_review_cards(material_id: str) -> JSONResponse:
-        """列出这个视频的标记生成的复习卡。"""
+    if add_endpoints:
 
-        try:
-            cards = await list_cards(material_id)
+        @router.get("/bilibili/materials/{material_id}/review-cards")
+        async def bilibili_review_cards(material_id: str) -> JSONResponse:
+            """列出这个视频的标记生成的复习卡。"""
+
+            try:
+                cards = await list_cards(material_id)
+                return JSONResponse(
+                    {"material_id": material_id, "cards": cards, "total": len(cards)},
+                    headers={"Cache-Control": "no-store"},
+                )
+            except Exception as exc:  # noqa: BLE001
+                return JSONResponse(
+                    {"material_id": material_id, "cards": [], "total": 0, "error": str(exc)},
+                    headers={"Cache-Control": "no-store"},
+                )
+
+        @router.post("/bilibili/materials/{material_id}/review-sync")
+        async def bilibili_review_sync(material_id: str) -> JSONResponse:
+            """手动全量同步（自动同步关闭时的前台按钮也能用）。
+
+            marks 与 annotations 两套存储都同步 —— 材料可能来自任一路径。
+            """
+
+            try:
+                marks = await sync_material(material_id)
+            except Exception as exc:  # noqa: BLE001
+                marks = {"error": str(exc)}
+            try:
+                annotations = await sync_annotations(material_id)
+            except Exception as exc:  # noqa: BLE001
+                annotations = {"error": str(exc)}
             return JSONResponse(
-                {"material_id": material_id, "cards": cards, "total": len(cards)},
+                {"material_id": material_id, "marks": marks, "annotations": annotations},
                 headers={"Cache-Control": "no-store"},
             )
-        except Exception as exc:  # noqa: BLE001
+
+        @router.post("/bilibili/review-backfill")
+        async def bilibili_review_backfill() -> JSONResponse:
+            """手动补建：把升级前打的老标记一次性转成复习卡（幂等）。"""
+
+            try:
+                result = await backfill_all()
+                return JSONResponse(result, headers={"Cache-Control": "no-store"})
+            except Exception as exc:  # noqa: BLE001
+                return JSONResponse(
+                    {"error": str(exc)}, status_code=400, headers={"Cache-Control": "no-store"}
+                )
+
+        @router.get("/bilibili/review-settings")
+        async def bilibili_review_settings_get() -> JSONResponse:
+            return JSONResponse(load_settings(), headers={"Cache-Control": "no-store"})
+
+        @router.put("/bilibili/review-settings")
+        async def bilibili_review_settings_put(payload: ReviewSettingsRequest) -> JSONResponse:
             return JSONResponse(
-                {"material_id": material_id, "cards": [], "total": 0, "error": str(exc)},
-                headers={"Cache-Control": "no-store"},
+                save_settings(payload.model_dump()), headers={"Cache-Control": "no-store"}
             )
 
-    @router.post("/bilibili/materials/{material_id}/review-sync")
-    async def bilibili_review_sync(material_id: str) -> JSONResponse:
-        """手动全量同步（自动同步关闭时的前台按钮也能用）。"""
-
-        try:
-            result = await sync_material(material_id)
-            return JSONResponse(result, headers={"Cache-Control": "no-store"})
-        except Exception as exc:  # noqa: BLE001
-            return JSONResponse(
-                {"material_id": material_id, "error": str(exc)},
-                status_code=400,
-                headers={"Cache-Control": "no-store"},
-            )
-
-    @router.post("/bilibili/review-backfill")
-    async def bilibili_review_backfill() -> JSONResponse:
-        """手动补建：把升级前打的老标记一次性转成复习卡（幂等）。"""
-
-        try:
-            result = await backfill_all()
-            return JSONResponse(result, headers={"Cache-Control": "no-store"})
-        except Exception as exc:  # noqa: BLE001
-            return JSONResponse(
-                {"error": str(exc)}, status_code=400, headers={"Cache-Control": "no-store"}
-            )
-
-    @router.get("/bilibili/review-settings")
-    async def bilibili_review_settings_get() -> JSONResponse:
-        return JSONResponse(load_settings(), headers={"Cache-Control": "no-store"})
-
-    @router.put("/bilibili/review-settings")
-    async def bilibili_review_settings_put(payload: ReviewSettingsRequest) -> JSONResponse:
-        return JSONResponse(
-            save_settings(payload.model_dump()), headers={"Cache-Control": "no-store"}
-        )
-
-    _INSTALLED = True
+    _INSTALLED_MODULES.add(module_name)
     _log(
-        f"复习卡闭环已挂载：包了 {wrapped} 个标记路由"
-        f"（材料详情路由{'已' if wrapped_get else '未'}包，用于触发历史补建）；"
-        "新增 /bilibili/materials/{id}/review-cards、/review-sync、"
-        "/review-backfill、/review-settings"
+        f"复习卡闭环已挂载（{module_name}）：包了 {wrapped} 个标记路由"
+        f"（材料详情路由{'已' if wrapped_get else '未'}包，用于触发历史补建）"
+        + ("；新增 /bilibili review 端点" if add_endpoints else "；不新增端点")
     )
     return True
 

@@ -85,12 +85,21 @@ class _VideoLearningPatch:
                     from dtpatch_bili import review as bili_review
 
                     bili_review.install(module)
+                    # AI 陪看（#2）：挂 companion 端点（复用后端 LLM 配置）。
+                    from dtpatch_bili import companion as bili_companion
+
+                    bili_companion.install(module)
                 else:
-                    # reading 路由不新增端点，只是把 _ingestion() 换成注入我们
-                    # loader 的版本，因此没有 include_router 那条时序约束。
+                    # reading 路由：换 _ingestion() 注入我们的 loader；同时包
+                    # annotations 路由把标记同步成复习卡（1.6.14 播放页的
+                    # saveMark 就走这里）。不新增端点，所以没有 include_router
+                    # 那条时序约束。
                     from dtpatch_bili import reading_patch
 
                     reading_patch.install(module)
+                    from dtpatch_bili import review as bili_review
+
+                    bili_review.install(module, add_endpoints=False)
             except Exception:  # noqa: BLE001 - never break the backend
                 _log(f"注入 {fullname} 失败，相关功能本次不可用:")
                 traceback.print_exc(file=sys.stderr)
