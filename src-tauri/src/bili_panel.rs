@@ -89,6 +89,67 @@ const PANEL_JS: &str = r##"
       });
   }
 
+  // ---- 字幕检索（#3）：把页面已拉取的材料数据留下来 ----
+  //
+  // ★ 为什么不新加后端端点：沉浸式观看页打开时，前端已经把整份材料
+  //   （含 transcript.cues / segments）拉回来了，只是藏在 React 状态里，
+  //   注入脚本够不着。包一层 fetch 把这些响应存下来，检索纯本地做 ——
+  //   零后端依赖、零额外请求、离线也能搜。
+  // ★ 为什么装在 fetch 上而不是轮询 DOM：字幕列表是虚拟滚动的，DOM 里
+  //   只有可见那几条；而材料 JSON 是全量。
+  // ★ 为什么早点装：SPA 路由切换不换文档，补丁装一次就全程有效；面板
+  //   每 3s 周期注入 + 幂等标记，用户打开视频时它早已装好。
+  var SUB_RECORDER = '__dtBiliSubRecorder';
+
+  function looksLikeMaterial(j) {
+    if (!j || typeof j !== 'object') { return false; }
+    var t = j.transcript;
+    var cues = t && Array.isArray(t.cues) ? t.cues : null;
+    var segs = Array.isArray(j.segments) ? j.segments
+             : (t && Array.isArray(t.segments) ? t.segments : null);
+    return !!j.material_id && !!((cues && cues.length) || (segs && segs.length));
+  }
+
+  function installRecorder() {
+    if (window[SUB_RECORDER]) { return; }
+    window[SUB_RECORDER] = { material: null };
+    var orig = window.fetch;
+    if (typeof orig !== 'function') { return; }
+    window.fetch = function () {
+      var out = orig.apply(this, arguments);
+      try {
+        var input = arguments[0];
+        var href = typeof input === 'string' ? input
+                 : (input && input.url) ? String(input.url) : '';
+        // 只克隆可能带材料的响应，避免给每个请求都加 JSON 解析开销
+        if (/material|reading|video-learning|watching/i.test(href)) {
+          out.then(function (resp) {
+            try {
+              resp.clone().json().then(function (j) {
+                if (looksLikeMaterial(j)) { window[SUB_RECORDER].material = j; }
+              }, function () {});
+            } catch (e) {}
+          }, function () {});
+        }
+      } catch (e) {}
+      return out;
+    };
+    log('subtitle recorder installed');
+  }
+
+  function recordedCues() {
+    var rec = window[SUB_RECORDER];
+    var m = rec && rec.material;
+    if (!m) { return []; }
+    var t = m.transcript || {};
+    var rows = Array.isArray(t.cues) && t.cues.length ? t.cues
+             : (Array.isArray(t.segments) && t.segments.length ? t.segments
+             : (Array.isArray(m.segments) && m.segments.length ? m.segments : []));
+    return rows.filter(function (r) {
+      return r && typeof r === 'object' && String(r.text || '').trim();
+    });
+  }
+
   // ---- React 受控组件的 value 写入法----
   function setReactValue(el, value) {
     var proto = (el.tagName === 'TEXTAREA') ? HTMLTextAreaElement.prototype
@@ -278,6 +339,165 @@ const PANEL_JS: &str = r##"
     return overlay;
   }
 
+  // ---- 字幕检索面板 ----
+  var subOverlay = null;
+
+  // ★ 跳转机制与前端自己的 seek 完全一致：B 站 iframe 的 src 带 `t=` 参数，
+  //   改参数即重载并从该秒开始（chunk 1241 里 `t:String(Math.floor(c))`）。
+  //   React 只在 src 相对自己上次渲染值变化时才写 DOM，所以我们从外部改的
+  //   属性能一直活到下一次前端主动 seek。
+  function seekBilibili(seconds) {
+    var nodes = document.querySelectorAll('iframe');
+    for (var i = 0; i < nodes.length; i++) {
+      var src = nodes[i].src || '';
+      if (src.indexOf('player.bilibili.com/player.html') === -1) { continue; }
+      try {
+        var url = new URL(src);
+        url.searchParams.set('t', String(Math.max(0, Math.floor(seconds))));
+        nodes[i].src = url.toString();
+        return true;
+      } catch (e) { return false; }
+    }
+    return false;
+  }
+
+  function fmtClock(sec) {
+    sec = Math.max(0, Math.round(Number(sec) || 0));
+    var h = Math.floor(sec / 3600), m = Math.floor((sec % 3600) / 60), s = sec % 60;
+    var pad = function (n) { return n < 10 ? '0' + n : String(n); };
+    return h > 0 ? (h + ':' + pad(m) + ':' + pad(s)) : (m + ':' + pad(s));
+  }
+
+  // 命中高亮：三段全是 textContent / createTextNode，绝不拼 HTML 字符串。
+  function appendHighlighted(container, text, needle) {
+    var idx = text.toLowerCase().indexOf(needle);
+    if (idx === -1) { container.appendChild(document.createTextNode(text)); return; }
+    container.appendChild(document.createTextNode(text.slice(0, idx)));
+    var mark = document.createElement('span');
+    mark.textContent = text.slice(idx, idx + needle.length);
+    mark.style.cssText = 'background:var(--primary,#e9544b);'
+      + 'color:var(--primary-foreground,#fff);border-radius:3px;padding:0 2px';
+    container.appendChild(mark);
+    container.appendChild(document.createTextNode(text.slice(idx + needle.length)));
+  }
+
+  function ensureSubOverlay() {
+    if (subOverlay && document.body.contains(subOverlay)) { return subOverlay; }
+    subOverlay = document.createElement('div');
+    subOverlay.style.cssText = 'position:fixed;inset:0;z-index:2147483000;display:none;'
+      + 'align-items:center;justify-content:center;background:rgba(0,0,0,.45)';
+
+    var panel = document.createElement('div');
+    panel.style.cssText = 'width:min(680px,92vw);max-height:82vh;display:flex;flex-direction:column;'
+      + 'background:var(--card,#fff);color:var(--foreground,#111);border-radius:12px;'
+      + 'box-shadow:0 18px 50px rgba(0,0,0,.28);overflow:hidden';
+
+    var head = document.createElement('div');
+    head.style.cssText = 'display:flex;align-items:center;gap:8px;padding:12px 14px;'
+      + 'border-bottom:1px solid var(--border,#e5e5e5)';
+    var title = document.createElement('div');
+    title.textContent = '字幕检索';
+    title.style.cssText = 'font-size:14px;font-weight:500;flex:1';
+    var close = document.createElement('button');
+    close.type = 'button';
+    close.textContent = '关闭';
+    close.style.cssText = 'font-size:12px;padding:4px 10px;border-radius:6px;cursor:pointer;'
+      + 'border:1px solid var(--border,#e5e5e5);background:transparent;color:inherit';
+    close.onclick = function () { subOverlay.style.display = 'none'; };
+    head.appendChild(title); head.appendChild(close);
+
+    var row = document.createElement('div');
+    row.style.cssText = 'display:flex;gap:8px;padding:12px 14px';
+    var q = document.createElement('input');
+    q.type = 'text';
+    q.placeholder = '搜本视频字幕，如「特征值」';
+    q.style.cssText = 'flex:1;min-width:0;height:34px;padding:0 10px;font-size:13px;border-radius:8px;'
+      + 'border:1px solid var(--border,#e5e5e5);background:var(--background,#fff);color:inherit';
+    var go = document.createElement('button');
+    go.type = 'button';
+    go.textContent = '检索';
+    go.style.cssText = 'height:34px;padding:0 16px;font-size:13px;border-radius:8px;cursor:pointer;'
+      + 'border:0;background:var(--primary,#e9544b);color:var(--primary-foreground,#fff)';
+    row.appendChild(q); row.appendChild(go);
+
+    var status = document.createElement('div');
+    status.style.cssText = 'padding:0 14px 8px;font-size:12px;color:var(--muted-foreground,#888);min-height:18px';
+    var list = document.createElement('div');
+    list.style.cssText = 'flex:1;overflow:auto;padding:0 8px 12px';
+
+    panel.appendChild(head); panel.appendChild(row); panel.appendChild(status); panel.appendChild(list);
+    subOverlay.appendChild(panel);
+    document.body.appendChild(subOverlay);
+    subOverlay.addEventListener('click', function (e) {
+      if (e.target === subOverlay) { subOverlay.style.display = 'none'; }
+    });
+
+    function run() {
+      var term = (q.value || '').trim();
+      if (!term) { status.textContent = '请输入关键词'; return; }
+      var cues = recordedCues();
+      if (!cues.length) {
+        status.textContent = '还没载入字幕数据 —— 请先打开这个视频的播放页，'
+          + '等字幕加载完（或点一下字幕列表）再试';
+        list.textContent = '';
+        return;
+      }
+      var needle = term.toLowerCase();
+      var hits = [];
+      for (var i = 0; i < cues.length && hits.length < 100; i++) {
+        var text = String(cues[i].text || '');
+        if (text.toLowerCase().indexOf(needle) !== -1) {
+          hits.push({ start: Number(cues[i].start) || 0, text: text });
+        }
+      }
+      if (!hits.length) {
+        status.textContent = '字幕里没有「' + term + '」';
+        list.textContent = '';
+        return;
+      }
+      status.textContent = '命中 ' + hits.length + ' 条 · 点一条跳到那一秒';
+      list.textContent = '';
+      hits.forEach(function (hit) {
+        var card = document.createElement('button');
+        card.type = 'button';
+        card.style.cssText = 'display:flex;gap:10px;width:100%;text-align:left;padding:8px;'
+          + 'border-radius:8px;border:0;background:transparent;cursor:pointer;align-items:flex-start';
+        card.onmouseenter = function () { card.style.background = 'var(--muted,#f3f3f3)'; };
+        card.onmouseleave = function () { card.style.background = 'transparent'; };
+
+        var stamp = document.createElement('div');
+        stamp.textContent = fmtClock(hit.start);
+        stamp.style.cssText = 'flex:none;font-size:11px;font-variant-numeric:tabular-nums;'
+          + 'padding:2px 6px;border-radius:5px;background:var(--muted,#f3f3f3);'
+          + 'color:var(--muted-foreground,#888)';
+
+        var body = document.createElement('div');
+        body.style.cssText = 'min-width:0;flex:1;font-size:13px;line-height:1.5';
+        appendHighlighted(body, hit.text, needle);
+
+        card.appendChild(stamp); card.appendChild(body);
+        card.onclick = function () {
+          if (seekBilibili(hit.start)) {
+            subOverlay.style.display = 'none';
+            log('seek to', hit.start);
+          } else {
+            status.textContent = '没找到 B 站播放器（iframe），无法跳转';
+          }
+        };
+        list.appendChild(card);
+      });
+    }
+
+    go.onclick = run;
+    q.addEventListener('keydown', function (e) { if (e.key === 'Enter') { e.preventDefault(); run(); } });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && subOverlay && subOverlay.style.display !== 'none') {
+        subOverlay.style.display = 'none';
+      }
+    });
+    return subOverlay;
+  }
+
   // ---- 装按钮 ----
   function install() {
     var input = findAnchorInput();
@@ -297,12 +517,30 @@ const PANEL_JS: &str = r##"
     };
     if (input.dataset) { input.dataset.dtBiliBtn = '1'; }
     (input.parentElement || input).insertBefore(btn, input.nextSibling);
+
+    // 字幕检索按钮（#3）：只在有字幕数据的页面才有意义，但装不装都无害 ——
+    // 没数据时面板会给明确提示，不会静默失败。
+    var sub = document.createElement('button');
+    sub.type = 'button';
+    sub.textContent = '字幕检索';
+    sub.style.cssText = 'margin-left:8px;height:34px;padding:0 12px;font-size:13px;cursor:pointer;'
+      + 'border-radius:8px;border:1px solid var(--border,#e5e5e5);'
+      + 'background:transparent;color:var(--foreground,inherit)';
+    sub.onclick = function () {
+      var ov = ensureSubOverlay();
+      ov.style.display = 'flex';
+      var q = ov.querySelector('input');
+      if (q) { q.focus(); }
+    };
+    (btn.parentElement || btn).insertBefore(sub, btn.nextSibling);
+
     log('button installed');
     return true;
   }
 
   // ---- 盯 DOM：SPA 切页不会触发 on_page_load，只能自己观察 ----
   function boot() {
+    installRecorder();
     if (install()) { return; }
     var mo = new MutationObserver(function () {
       if (install()) { mo.disconnect(); }
@@ -561,5 +799,57 @@ fn injection_is_periodic_not_one_shot() {
             text.contains("\"main\""),
             "主窗口不在 capability 的 windows 里"
         );
+    }
+
+    /// ★ #3 字幕检索：数据必须来自「包装 fetch 记录页面自己拉的材料 JSON」。
+    ///
+    /// 不猜后端端点（1.6.14 起前端走 reading 动态拼路径，猜不齐）；也不轮询
+    /// DOM（字幕列表虚拟滚动，DOM 里只有可见几条）。
+    #[test]
+    fn subtitle_search_records_page_material() {
+        assert!(
+            PANEL_JS.contains("__dtBiliSubRecorder"),
+            "缺字幕数据记录标记，重复注入会重复包装 fetch"
+        );
+        assert!(
+            PANEL_JS.contains("window.fetch = function"),
+            "必须包装 fetch 抓页面已拉取的材料 JSON"
+        );
+        assert!(
+            PANEL_JS.contains("resp.clone().json()"),
+            "要克隆响应读 JSON，不能消费原响应流"
+        );
+    }
+
+    /// 跳转必须走「改 iframe src 的 t 参数」—— 与前端自己的 seek 同机制
+    /// （chunk 1241 里 `t:String(Math.floor(c))`），不要去找播放器 SDK。
+    #[test]
+    fn subtitle_seek_rewrites_t_param() {
+        assert!(
+            PANEL_JS.contains("player.bilibili.com/player.html"),
+            "要定位 B 站播放器 iframe"
+        );
+        assert!(
+            PANEL_JS.contains("searchParams.set('t'"),
+            "跳转靠改 t 参数让 iframe 重载到那一秒"
+        );
+    }
+
+    /// 字幕检索入口按钮要装上；没字幕数据时面板给明确提示，不静默失败。
+    #[test]
+    fn subtitle_entry_button_and_hint_exist() {
+        assert!(PANEL_JS.contains("字幕检索"), "缺字幕检索入口按钮");
+        assert!(
+            PANEL_JS.contains("还没载入字幕数据"),
+            "没有数据时必须给可执行的提示，不能静默无结果"
+        );
+    }
+
+    /// 命中高亮分段必须走 textContent / createTextNode —— 字幕文本来自
+    /// B 站，等同用户数据，拼 innerHTML 既是注入面也违反 CSP 惯例。
+    #[test]
+    fn subtitle_highlight_avoids_inner_html() {
+        assert!(PANEL_JS.contains("appendHighlighted"), "缺高亮分段函数");
+        assert!(PANEL_JS.contains("createTextNode"), "高亮要用文本节点拼接");
     }
 }
