@@ -480,7 +480,8 @@ const PANEL_JS: &str = r##"
   //   改参数即重载并从该秒开始（chunk 1241 里 `t:String(Math.floor(c))`）。
   //   React 只在 src 相对自己上次渲染值变化时才写 DOM，所以我们从外部改的
   //   属性能一直活到下一次前端主动 seek。
-  //   高能进度条（#4）也复用这个查找器，别各写各的。
+  //   字幕检索跳转、课程续播 seek、播放器工具条定位都复用这个查找器，
+  //   别各写各的。
   function findBilibiliIframe() {
     var nodes = document.querySelectorAll('iframe');
     for (var i = 0; i < nodes.length; i++) {
@@ -924,136 +925,11 @@ const PANEL_JS: &str = r##"
     return aiOverlay;
   }
 
-  // ---- 高能进度条 + 热评（#4）----
-  //
-  // ★ 高能条为什么贴 iframe 上沿：B 站 iframe 不上报进度、也不接受外部
-  //   定位（只能改 src 的 t= 参数重载），进度条画进播放器内部不可能；
-  //   贴在播放器上方既能表达「全片弹幕密度」，又不遮播放器任何控件
-  //   （B 站控件条在底部，顶部 6px 盖的是画面，可接受）。
-  //   点击跳转复用 seekBilibili（与前端自己的 seek 同机制）。
-  // ★ 为什么要自己起 interval：本脚本每个页面上下文只跑一次
-  //   （window.__dtBiliPanel 幂等标记），boot 里那一次不够 —— 用户从别的
-  //   页面切回来、滚动页面都会让 iframe 移位。1s 轮询 + scroll/resize
-  //   监听足够，开销只是一次 querySelectorAll + getBoundingClientRect。
-  // ★ 失败必须**安静降级**：风控/网络失败时条置灰并在 title 里说明原因
-  //   （后端文案带倒计时），30s 内不重打；真没弹幕直接收掉，绝不挡画面。
-  var heatBar = null;
-  var heatFill = null;
-  var heatFor = '';
-  var heatState = '';       // '' = 没试过 / 'ok' = 有数据 / 'empty' = 确认没弹幕（终端态）
-  var heatFailedAt = -1e9;
-  var HEAT_COOLDOWN = 30000;
+  // ---- 热评面板（#4）----
   var hotOverlay = null;
   var hotRows = [];
 
-  // 只收 DOM，不动 heatFor/heatState —— 状态机要能记住「这个视频试过」
-  function removeHeatBar() {
-    if (heatBar && heatBar.parentNode) { heatBar.parentNode.removeChild(heatBar); }
-    heatBar = null;
-    heatFill = null;
-  }
 
-  function ensureHeatBar() {
-    var frame = findBilibiliIframe();
-    if (!frame) { return; }
-    var mid = recordedMaterialId();
-    if (!mid) {
-      // 换了视频但材料还没到：旧条留着会拿旧时长跳新视频，先收掉
-      if (heatFor || heatBar) { removeHeatBar(); heatFor = ''; heatState = ''; }
-      return;
-    }
-    if (heatFor === mid && heatState === 'empty') { return; }  // 确认没弹幕：不建条
-    if (!heatBar || !document.body.contains(heatBar)) {
-      heatBar = document.createElement('div');
-      heatBar.title = '高能进度条 · 弹幕密度（点击跳转）';
-      heatBar.style.cssText = 'position:fixed;z-index:2147482000;height:6px;'
-        + 'border-radius:3px;background:var(--border,#e5e5e5);cursor:pointer;'
-        + 'overflow:hidden;box-shadow:0 0 0 1px rgba(0,0,0,.06)';
-      heatFill = document.createElement('div');
-      heatFill.style.cssText = 'height:100%;width:100%';
-      heatBar.appendChild(heatFill);
-      heatBar.onclick = function (e) {
-        var dur = Number(heatBar.getAttribute('data-duration')) || 0;
-        if (dur <= 0) { return; }
-        var rect = heatBar.getBoundingClientRect();
-        var ratio = (e.clientX - rect.left) / Math.max(1, rect.width);
-        var secs = Math.floor(Math.min(1, Math.max(0, ratio)) * dur);
-        if (seekBilibili(secs)) {
-          heatBar.title = '高能进度条 · 已跳到 ' + fmtClock(secs);
-        }
-      };
-      document.body.appendChild(heatBar);
-    }
-    var rect = frame.getBoundingClientRect();
-    if (rect.width < 40 || rect.height < 40 || rect.bottom < 0 || rect.top > window.innerHeight) {
-      heatBar.style.display = 'none';  // 播放器滚出视口：不收条（位置还会回来），只隐藏
-      return;
-    }
-    heatBar.style.display = 'block';
-    heatBar.style.left = Math.round(rect.left) + 'px';
-    heatBar.style.top = Math.round(Math.max(2, rect.top - 9)) + 'px';
-    heatBar.style.width = Math.round(rect.width) + 'px';
-    // 状态机：ok/empty 是终端态不再打接口；失败（state='' 且刚失败过）
-    // 走 30s 冷却 —— 防每轮轮询都重打，风控期间重试只会延长封禁
-    if (heatFor === mid) {
-      if (heatState === 'ok' || heatState === 'empty') { return; }
-      if (Date.now() - heatFailedAt < HEAT_COOLDOWN) { return; }
-    }
-    heatFor = mid;
-    loadHeat(mid);
-  }
-
-  function loadHeat(mid) {
-    if (!heatBar) { return; }
-    heatState = '';
-    heatFill.style.background = '';
-    heatBar.removeAttribute('data-duration');
-    heatBar.title = '高能进度条 · 正在读取弹幕密度…';
-    window.fetch(AI_MATERIALS_API + encodeURIComponent(mid) + '/heat',
-                 { credentials: 'same-origin', cache: 'no-store' })
-      .then(function (r) { return r.json(); })
-      .then(function (j) {
-        if (!heatBar || heatFor !== mid) { return; }
-        var pts = (j && j.points) || [];
-        var max = Number(j && j.max) || 0;
-        var dur = Number(j && j.duration) || 0;
-        if (j && j.error) {
-          // 风控/网络失败：条留着但置灰，title 说清原因（后端文案带倒计时）
-          heatState = '';
-          heatFailedAt = Date.now();
-          heatBar.title = '高能进度条 · ' + j.error;
-          return;
-        }
-        if (!pts.length || max <= 0 || dur <= 0) {
-          heatState = 'empty';  // 终端态：确认没弹幕，不再打接口
-          removeHeatBar();
-          return;
-        }
-        heatState = 'ok';
-        heatBar.setAttribute('data-duration', String(dur));
-        // 一条 linear-gradient 画完整条密度（240 格 = 480 个 color stop，
-        // 单节点、无 240 个子 div，DOM 干净）
-        var stops = [];
-        for (var i = 0; i < pts.length; i++) {
-          var a = (0.22 + 0.78 * (pts[i] / max)).toFixed(2);
-          var p0 = (i / pts.length * 100).toFixed(2);
-          var p1 = ((i + 1) / pts.length * 100).toFixed(2);
-          stops.push('rgba(251,114,153,' + a + ') ' + p0 + '%');
-          stops.push('rgba(251,114,153,' + a + ') ' + p1 + '%');
-        }
-        heatFill.style.background = 'linear-gradient(to right,' + stops.join(',') + ')';
-        heatBar.title = '高能进度条 · 共 ' + (j.total || 0) + ' 条弹幕（点击跳转）';
-      })
-      .catch(function () {
-        if (heatFor === mid) {
-          heatState = '';
-          heatFailedAt = Date.now();
-        }
-        removeHeatBar();
-      });
-  }
-
-  // ---- 热评面板（#4）----
   function ensureHotOverlay() {
     if (hotOverlay && document.body.contains(hotOverlay)) { return hotOverlay; }
     hotOverlay = document.createElement('div');
@@ -1528,7 +1404,87 @@ const PANEL_JS: &str = r##"
   }
 
   // ---- 装按钮 ----
-  function install() {
+  // ---- 观看功能工具条：#3 字幕检索 / #2 AI 陪看 / #4 热评 / #6 课程 ----
+  //
+  // ★ 为什么不挂顶部「搜索视频或粘贴视频链接」导入栏（v0.2.21 真机反馈
+  //   「找不到入口」）：导入栏是「往阅读库塞新视频」的工具，与「正在看
+  //   视频时做的事」语义错位；且用户一滚动专注看视频，导入栏直接出视口，
+  //   按钮跟着消失。挂到播放器容器里：随视频出现、与播放/字幕状态同区域、
+  //   跟着播放器一起滚，视线不用离开播放器。
+  // ★ 幂等判据是「容器里还有没有 .dt-bili-bar」而不是 dataset 永久标记：
+  //   React 重渲染会把注入的 DOM 连容器一起擦掉，查真实 DOM 才能在下一轮
+  //   轮询补回（自愈）；iframe 被整体替换（切视频）则新容器各自装一份。
+  function findPlayerHost() {
+    var frame = findBilibiliIframe();
+    if (!frame) { return null; }
+    var host = frame.parentElement;
+    if (!host || host === document.body) { return null; }
+    return host;
+  }
+
+  function mkBarButton(bar, label, open) {
+    var b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    b.style.cssText = 'height:34px;padding:0 12px;font-size:13px;cursor:pointer;'
+      + 'border-radius:8px;border:1px solid var(--border,#e5e5e5);'
+      + 'background:transparent;color:var(--foreground,inherit)';
+    b.onclick = open;
+    bar.appendChild(b);
+    return b;
+  }
+
+  function installToolbar() {
+    var frame = findBilibiliIframe();
+    if (!frame) { return false; }
+    var host = frame.parentElement;
+    if (!host || host === document.body) { return false; }
+    if (host.querySelector('.dt-bili-bar')) { return true; }
+    var bar = document.createElement('div');
+    bar.className = 'dt-bili-bar';
+    bar.style.cssText = 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;'
+      + 'margin:0 0 8px';
+    // 字幕检索（#3）：没字幕数据时面板给明确提示，不静默失败。
+    mkBarButton(bar, '字幕检索', function () {
+      var ov = ensureSubOverlay();
+      ov.style.display = 'flex';
+      var q = ov.querySelector('input');
+      if (q) { q.focus(); }
+    });
+    // AI 陪看（#2）：问一问 / 章节摘要 / 解释标记。没字幕数据时面板给
+    // 明确提示，不会静默失败。
+    mkBarButton(bar, 'AI 陪看', function () {
+      var ov = ensureAiOverlay();
+      ov.style.display = 'flex';
+      if (ov.__dtAiRefresh) { ov.__dtAiRefresh(); }
+      var box = ov.querySelector('input');
+      if (box) { box.focus(); }
+    });
+    // 热评（#4）：评论区高赞 + 「AI 总结热评」语料入口。取不到时面板给
+    // 明确提示，不影响播放。
+    mkBarButton(bar, '热评', function () {
+      var ov = ensureHotOverlay();
+      ov.style.display = 'flex';
+      if (ov.__dtHotRefresh) { ov.__dtHotRefresh(); }
+    });
+    // 课程（#6）：分P/合集清单 + 「第几课看到哪」。取不到时面板给明确
+    // 提示，不影响播放。
+    mkBarButton(bar, '课程', function () {
+      var ov = ensureCourseOverlay();
+      ov.style.display = 'flex';
+      if (ov.__dtCourseRefresh) { ov.__dtCourseRefresh(); }
+    });
+    host.insertBefore(bar, frame);
+    log('player toolbar installed');
+    return true;
+  }
+
+  // ---- 导入入口：B站搜索按钮，锚在顶部导入栏（那是它该在的地方）----
+  //
+  // ★ 与观看工具条拆开：这个按钮的动作就是「搜一个视频、把 URL 填进那个
+  //   输入框并提交」，属于导入流，语义上就该挨着导入框。v0.2.22 重锚只搬
+  //   「看视频时做的事」，不搬它。
+  function installSearchButton() {
     var input = findAnchorInput();
     if (!input) { return false; }
     if (input.dataset && input.dataset.dtBiliBtn === '1') { return true; }
@@ -1546,86 +1502,17 @@ const PANEL_JS: &str = r##"
     };
     if (input.dataset) { input.dataset.dtBiliBtn = '1'; }
     (input.parentElement || input).insertBefore(btn, input.nextSibling);
-
-    // 字幕检索按钮（#3）：只在有字幕数据的页面才有意义，但装不装都无害 ——
-    // 没数据时面板会给明确提示，不会静默失败。
-    var sub = document.createElement('button');
-    sub.type = 'button';
-    sub.textContent = '字幕检索';
-    sub.style.cssText = 'margin-left:8px;height:34px;padding:0 12px;font-size:13px;cursor:pointer;'
-      + 'border-radius:8px;border:1px solid var(--border,#e5e5e5);'
-      + 'background:transparent;color:var(--foreground,inherit)';
-    sub.onclick = function () {
-      var ov = ensureSubOverlay();
-      ov.style.display = 'flex';
-      var q = ov.querySelector('input');
-      if (q) { q.focus(); }
-    };
-    (btn.parentElement || btn).insertBefore(sub, btn.nextSibling);
-
-    // AI 陪看按钮（#2）：问一问 / 章节摘要 / 解释标记。没字幕数据时面板
-    // 会给明确提示，不会静默失败。
-    var ai = document.createElement('button');
-    ai.type = 'button';
-    ai.textContent = 'AI 陪看';
-    ai.style.cssText = 'margin-left:8px;height:34px;padding:0 12px;font-size:13px;cursor:pointer;'
-      + 'border-radius:8px;border:1px solid var(--border,#e5e5e5);'
-      + 'background:transparent;color:var(--foreground,inherit)';
-    ai.onclick = function () {
-      var ov = ensureAiOverlay();
-      ov.style.display = 'flex';
-      if (ov.__dtAiRefresh) { ov.__dtAiRefresh(); }
-      var box = ov.querySelector('input');
-      if (box) { box.focus(); }
-    };
-    (sub.parentElement || sub).insertBefore(ai, sub.nextSibling);
-
-    // 热评按钮（#4）：评论区高赞 + 「AI 总结热评」语料入口。取不到时
-    // 面板给明确提示，不影响播放。
-    var hot = document.createElement('button');
-    hot.type = 'button';
-    hot.textContent = '热评';
-    hot.style.cssText = 'margin-left:8px;height:34px;padding:0 12px;font-size:13px;cursor:pointer;'
-      + 'border-radius:8px;border:1px solid var(--border,#e5e5e5);'
-      + 'background:transparent;color:var(--foreground,inherit)';
-    hot.onclick = function () {
-      var ov = ensureHotOverlay();
-      ov.style.display = 'flex';
-      if (ov.__dtHotRefresh) { ov.__dtHotRefresh(); }
-    };
-    (ai.parentElement || ai).insertBefore(hot, ai.nextSibling);
-
-    // 课程按钮（#6）：分P/合集清单 + 「第几课看到哪」。取不到时面板给
-    // 明确提示，不影响播放。
-    var course = document.createElement('button');
-    course.type = 'button';
-    course.textContent = '课程';
-    course.style.cssText = 'margin-left:8px;height:34px;padding:0 12px;font-size:13px;cursor:pointer;'
-      + 'border-radius:8px;border:1px solid var(--border,#e5e5e5);'
-      + 'background:transparent;color:var(--foreground,inherit)';
-    course.onclick = function () {
-      var ov = ensureCourseOverlay();
-      ov.style.display = 'flex';
-      if (ov.__dtCourseRefresh) { ov.__dtCourseRefresh(); }
-    };
-    (hot.parentElement || hot).insertBefore(course, hot.nextSibling);
-
-    log('button installed');
+    log('search button installed');
     return true;
   }
 
   // ---- 盯 DOM：SPA 切页不会触发 on_page_load，只能自己观察 ----
   function boot() {
     installRecorder();
-    // 高能进度条（#4）：立即跑一次 + 1s 轮询 + 滚动/缩放重定位。
-    // 本脚本每页面上下文只跑一次，轮询是唯一的「持续跟踪」手段。
+    // 课程续播（#6）：等播放器就绪后执行一次 pending seek。
     try {
-      ensureHeatBar();
-      window.setInterval(ensureHeatBar, 1000);
       window.setInterval(checkPendingSeek, 1000);
-      window.addEventListener('scroll', ensureHeatBar, true);
-      window.addEventListener('resize', ensureHeatBar);
-    } catch (e) { log('heat bar boot failed: ' + e); }
+    } catch (e) { log('pending seek boot failed: ' + e); }
     // 观看进度（#6）：5s 一存 + 离开页面补存一次。iframe 不上报进度，
     // 估算值靠 tick 推进；存的是高水位，重看不刷回去。
     try {
@@ -1636,11 +1523,19 @@ const PANEL_JS: &str = r##"
     try {
       window.setInterval(checkAsr, 5000);
     } catch (e) { log('asr boot failed: ' + e); }
-    if (install()) { return; }
-    var mo = new MutationObserver(function () {
-      if (install()) { mo.disconnect(); }
-    });
-    mo.observe(document.documentElement, { childList: true, subtree: true });
+    // 观看功能工具条（#3/#2/#4/#6）：锚在播放器容器。1s 自愈轮询 ——
+    // React 重渲染会擦掉注入的 DOM，SPA 切视频会换 iframe，幂等判据
+    // （容器里还有没有 .dt-bili-bar）保证不会插出第二条。
+    try {
+      installToolbar();
+      window.setInterval(installToolbar, 1000);
+    } catch (e) { log('toolbar boot failed: ' + e); }
+    // 导入入口（B站搜索按钮）：锚在顶部导入栏，同样 1s 自愈（SPA 切页
+    // 会重渲输入框）。dataset 标记 + 按钮还在不在双保险，不重复插。
+    try {
+      installSearchButton();
+      window.setInterval(installSearchButton, 1000);
+    } catch (e) { log('search button boot failed: ' + e); }
     log('observing');
   }
 
@@ -1925,6 +1820,10 @@ fn injection_is_periodic_not_one_shot() {
             "要定位 B 站播放器 iframe"
         );
         assert!(
+            PANEL_JS.contains("function seekBilibili"),
+            "跳转要收敛成共用函数（字幕检索命中/课程续播复用）"
+        );
+        assert!(
             PANEL_JS.contains("searchParams.set('t'"),
             "跳转靠改 t 参数让 iframe 重载到那一秒"
         );
@@ -2034,79 +1933,60 @@ fn injection_is_periodic_not_one_shot() {
         );
     }
 
-    /// ★ #4 高能进度条：必须打后端 /heat 端点（同源 fetch），弹幕密度由
-    /// 后端算好（list.so XML → 每秒密度点串），前端只画条。
+    /// ★ 入口重锚（v0.2.22 真机反馈「找不到入口」）：观看功能必须挂在
+    /// B站播放器容器里，不是顶部「搜索视频或粘贴视频链接」导入栏 ——
+    /// 导入栏是「塞新视频」的工具，与「看视频时做的事」语义错位，且一
+    /// 滚动就出视口。播放器容器随视频出现、与播放/字幕状态同区域。
     #[test]
-    fn heat_bar_uses_backend_endpoint() {
+    fn watching_features_anchor_at_player_container() {
         assert!(
-            PANEL_JS.contains("'/heat'"),
-            "高能条要打后端 /heat 端点"
+            PANEL_JS.contains("function findPlayerHost"),
+            "要有独立的播放器容器查找函数（锚点从导入栏搬到播放器）"
         );
         assert!(
-            PANEL_JS.contains("'/hot-comments'"),
-            "热评要打后端 /hot-comments 端点"
+            PANEL_JS.contains("player.bilibili.com/player.html"),
+            "播放器容器靠 B站 iframe 定位"
         );
         assert!(
-            PANEL_JS.contains("credentials: 'same-origin'"),
-            "同源 fetch 要显式带 cookie，否则鉴权失败"
+            PANEL_JS.contains("dt-bili-bar"),
+            "工具条要有可识别 class（幂等判据靠它）"
+        );
+        assert!(
+            PANEL_JS.contains("host.insertBefore(bar, frame)"),
+            "工具条要插进播放器容器（画面上方），不是页面级浮层"
         );
     }
 
-    /// 高能条是装饰性功能：失败必须安静降级 —— 风控失败置灰并在 title
-    /// 说明原因（后端文案带倒计时），真没弹幕直接收掉，绝不挡画面。
+    /// 工具条必须自愈：React 重渲染会擦掉注入的 DOM，SPA 切视频会换
+    /// iframe —— 幂等判据不能是「装过一次永久标记」，要每轮查真实 DOM，
+    /// 擦掉下一轮轮询就补回。
     #[test]
-    fn heat_bar_degrades_silently() {
+    fn player_toolbar_self_heals() {
         assert!(
-            PANEL_JS.contains("function removeHeatBar"),
-            "要能把条收掉（降级路径）"
+            PANEL_JS.contains("querySelector('.dt-bili-bar')"),
+            "幂等判据要查容器里还有没有工具条，擦掉才能补回"
         );
         assert!(
-            PANEL_JS.contains("if (j && j.error)"),
-            "后端报错（风控/网络）要识别并置灰说明，不能当没弹幕"
-        );
-        assert!(
-            PANEL_JS.contains("heatState = 'empty'"),
-            "零弹幕要是终端态，不能每轮轮询都重打接口"
-        );
-        assert!(
-            PANEL_JS.contains("heatFailedAt"),
-            "失败后要冷却，不能每轮轮询都重打接口"
+            PANEL_JS.contains("setInterval(installToolbar"),
+            "要轮询自愈（一次性注入不够：SPA 切页/重渲染都会丢）"
         );
     }
 
-    /// 点条跳转必须换算全片时长并复用 seekBilibili（改 t= 参数），
-    /// 与前端自己的 seek 同机制。
+    /// 导入入口（B站搜索按钮）留在导入栏：它的动作就是「搜一个视频、
+    /// 把 URL 填进那个框并提交」，属于导入流，不该搬去播放器。
     #[test]
-    fn heat_bar_click_seeks() {
+    fn search_entry_stays_at_import_bar() {
         assert!(
-            PANEL_JS.contains("if (seekBilibili(secs))"),
-            "点高能条要复用 seekBilibili 跳转"
+            PANEL_JS.contains("function installSearchButton"),
+            "B站搜索按钮要有独立安装函数（与观看工具条解耦）"
         );
         assert!(
-            PANEL_JS.contains("getAttribute('data-duration')"),
-            "跳转要按全片时长把点击位置换算成秒数"
+            PANEL_JS.contains("insertBefore(btn, input.nextSibling)"),
+            "B站搜索按钮仍锚在导入输入框旁"
         );
         assert!(
-            PANEL_JS.contains("function findBilibiliIframe"),
-            "iframe 查找要收敛成共用函数（seek/位置/高能条复用）"
-        );
-    }
-
-    /// 高能条贴在 iframe 上沿（不遮播放器控件），且要持续跟踪 iframe
-    /// 位置 —— 本脚本每页面上下文只跑一次，必须轮询。
-    #[test]
-    fn heat_bar_tracks_iframe_position() {
-        assert!(
-            PANEL_JS.contains("rect.top - 9"),
-            "条要贴在 iframe 上沿而不是盖住播放器"
-        );
-        assert!(
-            PANEL_JS.contains("window.setInterval(ensureHeatBar, 1000)"),
-            "要 1s 轮询重定位（一次性注入不够：SPA 切页/滚动都会移位）"
-        );
-        assert!(
-            PANEL_JS.contains("addEventListener('scroll', ensureHeatBar, true)"),
-            "滚动要即时重定位（捕获阶段才能听到容器滚动）"
+            PANEL_JS.contains("setInterval(installSearchButton"),
+            "导入按钮也要自愈轮询（SPA 切页会重渲输入框）"
         );
     }
 
@@ -2116,6 +1996,10 @@ fn injection_is_periodic_not_one_shot() {
     fn hot_comments_feed_ai_as_context() {
         assert!(PANEL_JS.contains("热评"), "缺热评入口按钮");
         assert!(PANEL_JS.contains("AI 总结热评"), "缺热评喂 AI 的入口");
+        assert!(
+            PANEL_JS.contains("'/hot-comments'"),
+            "热评要打后端 /hot-comments 端点（同源 fetch）"
+        );
         assert!(
             PANEL_JS.contains("aiOverlay.__dtAiAsk = ask"),
             "AI 面板要暴露带语料提问的入口"
