@@ -1,7 +1,18 @@
 """启动钩子:由 PYTHONPATH 上的 ``sitecustomize.py`` 在解释器启动时 import。
 
-职责只有一件:把「B 站沉浸式观看」的能力注入
-``deeptutor.video_learning.service``。
+职责只有一件:把「B 站搜索」的能力注入
+``deeptutor.video_learning.service`` 与相关路由。
+
+# 2026-10-18 拆除记录
+
+曾在此挂载字幕检索 / AI 陪看 / 热评 / 课程化进度 / ASR 兜底 / 标记同步
+等「沉浸式观看增强」（review / companion / heat / series / asr 五个模块），
+用户真机试用后判定为无用的设计测试，已全部拆除，只留 B站搜索。
+保留的两处注入是**搜索的地基**，删了搜索→导入→播放会断:
+
+* ``video_learning.service`` —— B 站材料解析（apply_patch）;
+* ``api.routers.reading`` —— 摄入流水线换我们带 cookie 的 loader
+  （上游 loader 接口选错 + 不带 cookie + UA 被当爬虫，三重失效）。
 
 # 为什么用import 钩子而不是改文件
 
@@ -80,41 +91,14 @@ class _VideoLearningPatch:
                     # ★ 必须在 include_router 之前完成 —— router 模块 import 完
                     # 就立刻注册,那时app 还没遍历它的 routes。
                     bili_router.install(module)
-                    # 复习卡闭环（#1）：包标记路由 + 挂 review 端点。
-                    # 同样赶在 include_router 之前；失败不影响上面已挂的。
-                    from dtpatch_bili import review as bili_review
-
-                    bili_review.install(module)
-                    # AI 陪看（#2）：挂 companion 端点（复用后端 LLM 配置）。
-                    from dtpatch_bili import companion as bili_companion
-
-                    bili_companion.install(module)
-                    # 高能进度条 + 热评（#4）：两个 GET 端点，失败走 body.error
-                    # 降级，同样是 include_router 之前装完。
-                    from dtpatch_bili import heat as bili_heat
-
-                    bili_heat.install(module)
-                    # 合集/分P 追更 + 课程进度（#6）：课程结构端点。同样是
-                    # 一个 GET + 永远 200 降级，与上面两个并列装完。
-                    from dtpatch_bili import series as bili_series
-
-                    bili_series.install(module)
-                    # 无字幕 ASR 兜底（#5）：POST 触发 / GET 查状态的端点，
-                    # 后台跑长视频转写、失败静默降级，同样并列装完。
-                    from dtpatch_bili import asr as bili_asr
-
-                    bili_asr.install(module)
                 else:
-                    # reading 路由：换 _ingestion() 注入我们的 loader；同时包
-                    # annotations 路由把标记同步成复习卡（1.6.14 播放页的
-                    # saveMark 就走这里）。不新增端点，所以没有 include_router
-                    # 那条时序约束。
+                    # reading 路由：换 _ingestion() 注入我们的 loader。这是
+                    # B 站导入的地基 —— 上游 loader 三重失效，不注入它
+                    # 「搜索→导入→播放」整条链会断。不新增端点，所以没有
+                    # include_router 那条时序约束。
                     from dtpatch_bili import reading_patch
 
                     reading_patch.install(module)
-                    from dtpatch_bili import review as bili_review
-
-                    bili_review.install(module, add_endpoints=False)
             except Exception:  # noqa: BLE001 - never break the backend
                 _log(f"注入 {fullname} 失败，相关功能本次不可用:")
                 traceback.print_exc(file=sys.stderr)

@@ -342,7 +342,7 @@ _MAX_COURSE_ITEMS = 300
 
 
 def _extract_pages(pages: list[Any]) -> list[dict[str, Any]]:
-    """``view`` 接口的 ``pages`` → 分P 清单（#6 课程化）。
+    """``view`` 接口的 ``pages`` → 分P 清单。
 
     只要 page/part/cid/duration 四个字段：面板画列表 + 按全片时长换算秒数
     够用，不带 dimension/first_frame 这些体积大的。坏行跳过，与上游
@@ -369,7 +369,7 @@ def _extract_pages(pages: list[Any]) -> list[dict[str, Any]]:
 
 
 def _extract_season(season: Any) -> dict[str, Any] | None:
-    """``view`` 接口的 ``ugc_season`` → 合集结构（#6 课程化）。
+    """``view`` 接口的 ``ugc_season`` → 合集结构。
 
     B 站合集是 sections→episodes 两层；episode 顶层 ``duration`` 实测是
     ``None``，真实时长在 ``episode["page"]["duration"]``。扁平化成
@@ -425,9 +425,9 @@ async def _fetch_bilibili_media(
 ) -> BilibiliMedia:
     """抓 B 站元数据 + 字幕 + 章节。
 
-    ``capture``（可选）用来把 ``view`` 接口里的 ``aid`` 截出来 —— 热评接口
-    （``x/v2/reply/main``）要拿它当 ``oid``。``BilibiliMedia`` 是上游
-    frozen+slots dataclass，塞不进额外字段，只能从旁路捞。
+    ``capture``（可选）用来把 ``view`` 接口里的 ``aid`` / 分P / 合集结构
+    截出来旁路保存。``BilibiliMedia`` 是上游 frozen+slots dataclass，塞不进
+    额外字段，只能从旁路捞。
 
     ★ 为什么不能直接用上游 ``_load_bilibili_media``（实测三重失效）：
 
@@ -490,8 +490,8 @@ async def _fetch_bilibili_media(
             view = await _api_call(client, "/x/web-interface/view", {"bvid": request.bvid})
             if capture is not None:
                 capture["aid"] = int(view.get("aid") or 0)
-                # #6 课程化：分P清单 + 合集结构旁路捞出来（BilibiliMedia 是
-                # frozen+slots 塞不进，跟 aid 一个路子）。
+                # 分P清单 + 合集结构旁路捞出来（BilibiliMedia 是 frozen+slots
+                # 塞不进，跟 aid 一个路子）。
                 capture["pages"] = _extract_pages(
                     view.get("pages") if isinstance(view.get("pages"), list) else []
                 )
@@ -715,12 +715,8 @@ async def _resolve_bilibili(module, url: str, language: Any) -> dict[str, Any]:
         "provider_cache": {
             "bilibili_page": int(getattr(media, "page_number", 1) or 1),
             "bilibili_cid": int(getattr(media, "cid", 0) or 0),
-            # aid 给热评接口（x/v2/reply/main 的 oid）用；老材料没这个字段，
-            # heat.py 会自己打 view 补，见那里的兜底分支。
+            # aid / 分P / 合集结构旁路存根（老材料没有这些字段）。
             "bilibili_aid": int(captured.get("aid") or 0),
-            # #6 课程化：分P清单（page/part/cid/duration）与合集结构
-            # （sections→episodes 扁平化）。老材料没有这两个字段，
-            # series.py 端点会自己打 view 补取。
             "bilibili_pages": captured.get("pages") or [],
             "bilibili_season": captured.get("season"),
         },
