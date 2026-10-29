@@ -86,6 +86,16 @@ impl InstalledEnv {
         self.map.get(&canonical_name(name))
     }
 
+    /// 向快照里注入一个「已装」包。
+    ///
+    /// 用途:热更新正在安装的根包(`deeptutor`)本身也会被它的子依赖
+    /// 声明(如 `deeptutor-server` 写 `deeptutor==1.7.0`)。若不标记它已满足,
+    /// 解析器会把它当成缺失依赖重新拉一份 —— 既浪费又可能和正在解压的本体
+    /// 打架。安装流程在拿到目标版本后调用本方法把它「预置」为已装。
+    pub fn seed(&mut self, name: &str, version: &Version) {
+        self.map.insert(canonical_name(name), version.clone());
+    }
+
     pub fn len(&self) -> usize {
         self.map.len()
     }

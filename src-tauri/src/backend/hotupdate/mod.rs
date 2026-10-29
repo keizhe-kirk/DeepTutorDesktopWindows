@@ -60,6 +60,24 @@ use resolve::InstalledEnv;
 /// PyPI 上的包名。
 pub const PACKAGE: &str = "deeptutor";
 
+/// 桌面端运行 `deeptutor` 所必需的 extra。
+///
+/// deeptutor 1.7+ 把原本的单体包拆成了「基础包 + 一组可选 extra」:
+/// - `server`  → `deeptutor-server`(`start` 命令 `require_module("server")`)
+/// - `web`     → `deeptutor-web`(`start` 命令 `require_module("web")`)
+/// - `video-learning` → `deeptutor-reading`(本壳的 B 站搜索补丁要
+///   `import deeptutor.reading.ingestion`,且其传递依赖会带出
+///   knowledge/parsing/mastery/notebook 等子模块)
+///
+/// 基础包 METADATA 里这些 extra 的 `Requires-Dist` 都带 `; extra == "..."`
+/// 标记,在「空 extras」下会被[`resolve::applies`]过滤掉,于是热更新只装了
+/// 基础包、缺失模块包 → 后端 `ModuleUnavailable` 崩溃。所以这里把它们显式
+/// 展开进依赖解析(见[`expand_required_extras`])。
+///
+/// 1.6.x 仍是单体包、没有这些 extra,展开函数找不到匹配行就原样返回,
+/// 向下兼容。若上游新增了桌面必须依赖的 extra,在此追加即可。
+const REQUIRED_BACKEND_EXTRAS: &[&str] = &["server", "web", "video-learning"];
+
 /// 进度事件名。前端启动页与托盘 tooltip 都监听它。
 pub const EVENT_PROGRESS: &str = "backend-update://progress";
 
@@ -425,6 +443,36 @@ fn reload_web_ui_if_on_it(app: &AppHandle) {
     let _ = win.eval("window.location.reload()");
 }
 
+/// 把 `requires_dist` 中标注 `; extra == "X"` 且 X 属于[`REQUIRED_BACKEND_EXTRAS`]
+/// 的行,剥掉 extra 标记后追加回去,使对应的可选模块 wheel 进入依赖解析。
+///
+/// 例:`deeptutor-server==1.7.0; extra == "server"`
+///   → 追加 `deeptutor-server==1.7.0`(裸约束)。
+///
+/// 组合 marker(如 `python_version < "3.14" and extra == "graphrag"`)也按
+/// 「含有 `extra == "X"` 子串」判定,取 `;` 前的裸约束即可 —— 剥掉整个
+/// marker 后该依赖的其余条件(若还有)也随之消失,但我们的目标 extra 都是
+/// 纯 `extra == "X"` 形态,不会丢有效约束。
+fn expand_required_extras(requires_dist: &[String]) -> Vec<String> {
+    let mut out = requires_dist.to_vec();
+    for raw in requires_dist {
+        let Some((bare, _)) = raw.split_once(';') else {
+            continue;
+        };
+        let bare = bare.trim();
+        if bare.is_empty() {
+            continue;
+        }
+        let wanted = REQUIRED_BACKEND_EXTRAS
+            .iter()
+            .any(|e| raw.contains(&format!("extra == \"{e}\"")));
+        if wanted {
+            out.push(bare.to_string());
+        }
+    }
+    out
+}
+
 /// 安装主体(下载 -> 解析依赖 -> 解压 -> 激活)。
 async fn do_install(ctx: &Ctx, target_str: &str, main_file: &ReleaseFile) -> Result<InstallReport, String> {
     let app = &ctx.app;
@@ -460,15 +508,26 @@ async fn do_install(ctx: &Ctx, target_str: &str, main_file: &ReleaseFile) -> Res
     if let Some(dir) = ctx.ov.effective_dir(ctx.bundled_ver.as_deref()) {
         scan_dirs.push(dir);
     }
-    let installed = InstalledEnv::scan(&scan_dirs);
+    let mut installed = InstalledEnv::scan(&scan_dirs);
     log::info!("已装环境扫描到 {} 个包", installed.len());
+
+    // 把正在安装的根包本身标记为已满足:它的子依赖(如 `deeptutor-server`
+    // 声明 `deeptutor==1.7.0`)不应被当成缺失依赖重新拉取一份。
+    if let Ok(target_ver) = Version::from_str(target_str) {
+        installed.seed(PACKAGE, &target_ver);
+    }
+
+    // 展开桌面必需的 extra(server/web/video-learning),让对应的模块 wheel
+    // 进入依赖解析(基础包 METADATA 里它们只是带 extra 标记的 Requires-Dist,
+    // 空 extras 下会被过滤掉,详见 [`REQUIRED_BACKEND_EXTRAS`] 注释)。
+    let requires_dist = expand_required_extras(&md.requires_dist);
 
     let plan = resolve::plan(
         &ctx.client,
         &ctx.tag,
         &marker_env,
         &installed,
-        &md.requires_dist,
+        &requires_dist,
         PACKAGE,
     )
     .await
@@ -810,5 +869,37 @@ mod tests {
         // 能原样反序列化回来(托盘侧就是这么用的)
         let back: Progress = serde_json::from_str(&json).unwrap();
         assert_eq!(back.phase, Phase::Downloading);
+    }
+
+    #[test]
+    fn expand_required_extras_pulls_server_web_reading() {
+        let requires = vec![
+            "PyYAML>=6.0".to_string(),
+            "deeptutor-server==1.7.0; extra == \"server\"".to_string(),
+            "deeptutor-web==1.7.0; extra == \"web\"".to_string(),
+            "deeptutor-reading==1.7.0; extra == \"video-learning\"".to_string(),
+            "deeptutor-partners==1.7.0; extra == \"partners\"".to_string(),
+            "deeptutor[server]==1.7.0; extra == \"dev\"".to_string(),
+        ];
+        let out = expand_required_extras(&requires);
+        // 原 6 行 + 展开出的 3 个裸约束(server/web/video-learning)
+        assert_eq!(out.len(), 9);
+        assert!(out.contains(&"deeptutor-server==1.7.0".to_string()));
+        assert!(out.contains(&"deeptutor-web==1.7.0".to_string()));
+        assert!(out.contains(&"deeptutor-reading==1.7.0".to_string()));
+        // 非必需 extra(partners)与带 extra 标记的自引用(dev)不应被展开
+        assert!(!out.contains(&"deeptutor-partners==1.7.0".to_string()));
+        assert!(!out.contains(&"deeptutor[server]==1.7.0".to_string()));
+    }
+
+    #[test]
+    fn expand_required_extras_is_noop_for_monolithic_16x() {
+        // 1.6.x 单体包没有 extra,展开后应与输入完全一致
+        let requires = vec![
+            "PyYAML>=6.0".to_string(),
+            "openai>=1.30.0".to_string(),
+        ];
+        let out = expand_required_extras(&requires);
+        assert_eq!(out, requires);
     }
 }
